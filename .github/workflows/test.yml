@@ -14,7 +14,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y bubblewrap
-      # Ubuntu 24.04 blocks unprivileged user namespaces through AppArmor, and bwrap needs one.
       - name: Allow unprivileged user namespaces
         run: |
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then

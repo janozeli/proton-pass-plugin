@@ -8,8 +8,6 @@ PIN = "9876"
 SEED = "SEEDSECRETVALUE"
 HOST_SECRET = "other-host-secret-value"
 
-# Stands in for pass-cli. `run` resolves pass:// values in the environment it was given, then execs the
-# argv after `--`, so a test observes the real child the way the real CLI would start it.
 FAKE = r'''#!PYTHON
 import json, os, sys
 here = os.path.dirname(os.path.abspath(__file__))
@@ -53,8 +51,6 @@ if not name:
 finish(open(path(name)).read())
 '''
 
-# Runs inside the sandbox, which has no host path to write to. With a network it sends what it saw to the
-# test's listener and exits 9. Without one it exits 7 if what it saw equals the test's expectation, else 8.
 CHILD = r'''
 import json, os, socket, sys
 port, want, *host = sys.argv[1:]
@@ -142,8 +138,6 @@ def child(d, port=1):
 
 
 class Operator:
-    """The human at the approval socket, played by the test as the same uid."""
-
     def __init__(self, d, reply=None, gate=None):
         self.prompts, self.reply, self.gate = [], reply or {"op": "allow"}, gate
         self.path = os.path.join(session(d), "approve.sock")

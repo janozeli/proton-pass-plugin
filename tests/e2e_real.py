@@ -1,6 +1,3 @@
-"""Real end-to-end against the user's Proton Pass via the MCP server. Never prints secret values.
-Starts a fresh session dir (forces auto-login) and approves its own releases on the approval socket,
-so run it only against your own account. test_fill.py covers the browser fill offline."""
 import json, re, shutil, tempfile
 from harness import Operator, session
 from mcp_client import Client

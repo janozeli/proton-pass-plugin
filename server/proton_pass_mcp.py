@@ -214,7 +214,6 @@ def serve_approvals():
                 conn.settimeout(10)
                 prompt = json.loads(conn.makefile("rb").readline(65536))
                 text = render(prompt)
-                # Drop type-ahead so an earlier keystroke cannot answer a prompt nobody has read yet.
                 termios.tcflush(tty_in, termios.TCIFLUSH)
                 print(text, file=tty, flush=True)
                 line = tty_in.readline().strip()
@@ -265,8 +264,6 @@ def get_totp(a):
     return {"code": codes[0]}
 
 
-# The tab may have navigated while the operator read the prompt, so the origin check runs in the
-# same turn as the typing.
 FILL = """({origin, username, password}) => {
   if (location.origin !== origin) return null;
   const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
