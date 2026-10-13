@@ -1,4 +1,3 @@
-"""Offline behavior tests. A fake pass-cli stands in for the real binary."""
 import json, os, stat, tempfile
 from mcp_client import Client
 
@@ -7,7 +6,7 @@ PASSWORD = "hunter2-secret-value"
 SEED = "SEEDSECRETVALUE"
 
 
-def install_fake(d):
+def install_fake(d, token=TOKEN):
     os.makedirs(d, exist_ok=True)
     open(os.path.join(d, "password"), "w").write(PASSWORD)
     item = {"item": {
@@ -57,7 +56,7 @@ echo "unexpected: $*" >&2; exit 1
 """)
     os.chmod(fake, 0o755)
     pat = os.path.join(d, "pat")
-    open(pat, "w").write(TOKEN + "\n")
+    open(pat, "w").write(token + "\n")
     os.chmod(pat, 0o600)
     return fake, pat
 
@@ -67,8 +66,8 @@ def calls(d):
     return open(p).read().splitlines() if os.path.exists(p) else []
 
 
-def start(d, chmod_pat=0o600, drop=(), **env):
-    fake, pat = install_fake(d)
+def start(d, chmod_pat=0o600, drop=(), token=TOKEN, **env):
+    fake, pat = install_fake(d, token)
     os.chmod(pat, chmod_pat)
     home = os.path.join(d, "home")
     os.makedirs(home, exist_ok=True)
@@ -185,6 +184,22 @@ def test_rejects_raw_env_values_and_bad_refs_before_run():
             assert "literal-secret-value" not in text, text
             assert TOKEN not in text
             assert not any(line.startswith("run ") for line in calls(d)[before:]), calls(d)
+    finally:
+        c.close()
+
+
+def test_short_token_is_redacted_on_login_failure():
+    d = tempfile.mkdtemp()
+    c = start(d, token="xy")
+    open(os.path.join(d, "login-fail"), "w").close()
+    try:
+        try:
+            c.call("list_vaults")
+            raise AssertionError("login should have failed")
+        except RuntimeError as e:
+            text = str(e)
+        assert "xy" not in text, text
+        assert "login failed" in text, text
     finally:
         c.close()
 
@@ -325,6 +340,7 @@ TESTS = [
     test_metadata_search_and_describe_hide_secrets,
     test_non_auth_error_is_not_a_relogin,
     test_login_failure_hides_the_token,
+    test_short_token_is_redacted_on_login_failure,
     test_later_error_hides_token_and_loaded_password,
     test_run_with_secrets_passes_refs_and_redacts_known_secrets,
     test_rejects_raw_env_values_and_bad_refs_before_run,

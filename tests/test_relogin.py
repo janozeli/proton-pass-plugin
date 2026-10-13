@@ -1,5 +1,4 @@
-"""Offline: a fake pass-cli that rejects calls until `login` runs proves auto re-login."""
-import os, stat, tempfile
+import os, tempfile
 from mcp_client import Client
 
 def test_relogin_on_expired_session():

@@ -1,4 +1,3 @@
-"""Tab choice for fill_login. Host match, not a substring of the whole URL."""
 import os, sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "server"))
 from proton_pass_mcp import tab_matches
