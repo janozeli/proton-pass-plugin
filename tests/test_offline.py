@@ -498,19 +498,24 @@ def test_leading_dash_ids_and_vaults_never_reach_pass_cli():
         c.close()
 
 
-def start_helper(d):
+def start_helper(d, timeout=None):
     master, slave = os.openpty()
-    p = subprocess.Popen([sys.executable, SERVER, "approve"], env=dict(os.environ, **server_env(d)),
+    argv = [sys.executable, SERVER, "approve"]
+    if timeout is not None:
+        code = ("import sys; sys.path.insert(0, %r); import proton_pass_mcp as m; "
+                "m.APPROVAL_TIMEOUT = %r; sys.argv = [%r, 'approve']; m.main()") % (os.path.dirname(SERVER), timeout, SERVER)
+        argv = [sys.executable, "-c", code]
+    p = subprocess.Popen(argv, env=dict(os.environ, **server_env(d)),
                          stdin=slave, stdout=slave, stderr=slave, start_new_session=True,
                          preexec_fn=lambda: fcntl.ioctl(0, termios.TIOCSCTTY, 0))
     os.close(slave)
     return p, master
 
 
-def read_tty(master, marker):
+def read_tty(master, marker, timeout=15):
     buf = b""
     while marker not in buf:
-        ready, _, _ = select.select([master], [], [], 15)
+        ready, _, _ = select.select([master], [], [], timeout)
         if not ready:
             raise AssertionError(f"the tty never showed {marker!r}: {buf!r}")
         buf += os.read(master, 4096)
@@ -595,6 +600,76 @@ def test_approve_helper_shows_the_claim_on_the_tty():
         helper.wait()
         os.close(tty)
         c.close()
+
+
+def approval_connection(d, title):
+    conn = socket.socket(socket.AF_UNIX)
+    conn.settimeout(3)
+    conn.connect(os.path.join(session(d), "approve.sock"))
+    conn.sendall(json.dumps({"action": "totp", "title": title, "reason": "test"}).encode() + b"\n")
+    return conn
+
+
+def test_approval_helper_expires_partial_terminal_input_and_accepts_next():
+    d = install()
+    helper, tty = start_helper(d, timeout=0.5)
+    try:
+        read_tty(tty, b"listening")
+        with approval_connection(d, "expired request") as expired:
+            read_tty(tty, b"denies.")
+            os.write(tty, b"approve")  # No newline: readline must not hold the helper forever.
+            assert json.loads(expired.recv(4096)) == {"op": "deny"}
+        with approval_connection(d, "next request") as next_request:
+            shown = read_tty(tty, b"denies.", timeout=2)
+            assert "next request" in shown
+            os.write(tty, b"approve\n")
+            assert json.loads(next_request.recv(4096)) == {"op": "allow"}
+    finally:
+        helper.kill()
+        helper.wait(timeout=5)
+        os.close(tty)
+
+
+def test_approval_helper_discards_disconnected_and_abandoned_queued_requests():
+    d = install()
+    helper, tty = start_helper(d, timeout=30)
+    try:
+        read_tty(tty, b"listening")
+        with approval_connection(d, "disconnected request") as abandoned:
+            read_tty(tty, b"denies.")
+            with approval_connection(d, "queued abandoned request"):
+                pass
+        with approval_connection(d, "live request") as live:
+            shown = read_tty(tty, b"live request", timeout=2)
+            assert "queued abandoned request" not in shown, shown
+            if "denies." not in shown:
+                read_tty(tty, b"denies.", timeout=2)
+            os.write(tty, b"approve\n")
+            assert json.loads(live.recv(4096)) == {"op": "allow"}
+    finally:
+        helper.kill()
+        helper.wait(timeout=5)
+        os.close(tty)
+
+
+def test_approval_helper_deadline_also_bounds_an_incomplete_prompt():
+    d = install()
+    helper, tty = start_helper(d, timeout=0.5)
+    try:
+        read_tty(tty, b"listening")
+        with socket.socket(socket.AF_UNIX) as incomplete:
+            incomplete.settimeout(2)
+            incomplete.connect(os.path.join(session(d), "approve.sock"))
+            incomplete.sendall(b'{"action":')
+            assert incomplete.recv(4096) == b""
+        with approval_connection(d, "after incomplete prompt") as live:
+            read_tty(tty, b"denies.", timeout=2)
+            os.write(tty, b"approve\n")
+            assert json.loads(live.recv(4096)) == {"op": "allow"}
+    finally:
+        helper.kill()
+        helper.wait(timeout=5)
+        os.close(tty)
 
 
 def test_approve_helper_refuses_a_symlink_socket():
