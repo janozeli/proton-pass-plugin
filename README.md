@@ -14,3 +14,6 @@ The server logs in with the token on demand and again whenever pass-cli reports 
 ## Tests
     cd tests && python3 test_relogin.py   # offline, fake pass-cli
     cd tests && python3 e2e_real.py       # real vault, private headless Chrome, never prints secrets
+
+## License
+MIT
