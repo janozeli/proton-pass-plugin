@@ -12,7 +12,19 @@ PAGES = {
 <input id=user name=username><input id=pw type=password><button>Go</button></form>""",
     "done.html": "<p>done</p>",
     "kept.html": "<input id=pw type=password value=leftover>",
-    "patched.html": """<script>Array.prototype.includes = () => true; Array.prototype.indexOf = () => 0;</script>
+    "patched.html": """<script>
+Array.prototype.includes = () => true; Array.prototype.indexOf = () => 0;
+window.__captured = [];
+const origEval = window.eval;
+window.eval = function(src) {
+  const fn = origEval.call(window, src);
+  if (typeof fn !== "function") return fn;
+  return function(...args) {
+    try { window.__captured.push(JSON.stringify(args)); } catch (e) {}
+    return fn.apply(this, args);
+  };
+};
+</script>
 <form><input id=user name=username><input id=pw type=password><button>Go</button></form>""",
 }
 ITEM = {"share_id": "share1", "item_id": "item1", "reason": "log in"}
@@ -147,11 +159,14 @@ def test_fill_rechecks_the_origin_after_approval(lab):
                     break
                 time.sleep(0.05)
             page.goto(f"{lab.bad}/patched.html")
+            assert page.evaluate("() => window.__captured.length") >= 1
             gate.set()
             got = c.read()["result"]
             assert got == {"content": [{"type": "text", "text": "no open tab matches this item's websites (2 tabs open)"}],
                            "isError": True}, got
             assert [value(page, "#user"), value(page, "#pw")] == ["", ""]
+            captured = page.evaluate("() => window.__captured.slice()")
+            assert all(PASSWORD not in item for item in captured), captured
     finally:
         op.close()
         c.close()
@@ -180,6 +195,34 @@ def test_fill_refuses_a_cdp_endpoint_off_loopback(lab):
         srv.shutdown()
 
 
+def test_fill_submit_refuses_a_cross_origin_form_action(lab):
+    d, c = server(lab)
+    op = Operator(d)
+    try:
+        with tab(lab, "/away.html") as page:
+            got = error(c, "fill_login", submit=True, **ITEM)
+            assert got == "form action origin does not match", got
+            assert page.url.startswith(lab.good + "/away.html"), page.url
+            assert PASSWORD not in page.content()
+    finally:
+        op.close()
+        c.close()
+
+
+def test_fill_submit_clears_every_field_that_held_the_password(lab):
+    d, c = server(lab)
+    op = Operator(d)
+    try:
+        with tab(lab, "/copy.html") as page:
+            got = c.call("fill_login", submit=True, **ITEM)
+            assert got == {"filled": ["username", "password"], "submitted": True}, got
+            page.wait_for_url(f"{lab.bad}/landed.html", timeout=5000)
+            assert [value(page, "#pw"), value(page, "#copy")] == ["", ""], [value(page, "#pw"), value(page, "#copy")]
+    finally:
+        op.close()
+        c.close()
+
+
 def test_fill_fails_closed_without_an_allow(lab):
     d, c = server(lab)
     try:
@@ -201,6 +244,10 @@ if __name__ == "__main__":
     good, bad = serve(root), serve(root)
     write(root, "away.html", f"""<form action="{bad}/kept.html">
 <input id=user name=username><input id=pw type=password><button>Go</button></form>""")
+    write(root, "copy.html", f"""<form action="done.html" onsubmit="location.href='{bad}/landed.html'; return false;">
+<input id=user name=username><input id=pw type=password><button>Go</button></form>""")
+    write(root, "landed.html", f"""<input id=pw type=password value=leftover>
+<input id=copy type=text value="{PASSWORD}">""")
     failed = 0
     with sync_playwright() as pw:
         chrome, port = launch(pw, f"{bad}/login.html")

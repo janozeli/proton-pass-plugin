@@ -1,4 +1,4 @@
-import fcntl, json, os, select, shutil, socket, stat, subprocess, sys, termios
+import fcntl, json, os, re, select, shutil, socket, stat, subprocess, sys, termios
 from harness import (PASSWORD, PIN, SEED, SERVER, TOKEN, Operator, calls, child, error, install, server_env,
                      session, start, write)
 
@@ -197,6 +197,49 @@ def test_run_rejects_relative_argv_reserved_names_and_literal_values():
         c.close()
 
 
+def test_linker_names_never_reach_the_sandbox_launcher():
+    d, c = start()
+    op = Operator(d)
+    try:
+        got = c.call("run_approved", argv=["/bin/true"], env={"LD_AUDIT": REF, "GLIBC_TUNABLES": REF, "GCONV_PATH": REF, "PW": REF}, reason="r")
+        assert isinstance(got.get("exit_code"), int), got
+        cli_env = json.load(open(os.path.join(d, "run-env.json")))
+        assert "LD_AUDIT" not in cli_env and "GLIBC_TUNABLES" not in cli_env and "GCONV_PATH" not in cli_env, cli_env
+        allowed = {"PATH", "PROTON_PASS_SESSION_DIR", "PROTON_PASS_AGENT_REASON"}
+        extra = [k for k in cli_env if k not in allowed and not re.fullmatch(r"PP\d+", k)]
+        assert extra == [], (extra, cli_env)
+    finally:
+        op.close()
+        c.close()
+
+
+def test_run_child_cannot_see_host_processes():
+    d, c = start()
+    op = Operator(d)
+    try:
+        code = r"""import os,sys
+pids=[n for n in os.listdir('/proc') if n.isdigit()]
+cmd=open('/proc/1/cmdline','rb').read()
+sys.exit(0 if len(pids)<=3 and cmd.startswith(b'/usr/bin/bwrap\0') else 4)
+"""
+        got = c.call("run_approved", argv=["/usr/bin/python3", "-c", code], env={"PW": REF}, reason="r")
+        assert got == {"exit_code": 0}, got
+    finally:
+        op.close()
+        c.close()
+
+
+def test_describe_item_returns_the_origin_only():
+    d, c = start(urls=["https://user:URLPASS-CANARY@bank.example/login?token=QUERYTOKEN#frag", "http://127.0.0.1:8765/a/b"])
+    try:
+        got = c.call("describe_item", share_id="share1", item_id="item1", reason="r")
+        assert got["urls"] == ["https://bank.example", "http://127.0.0.1:8765"], got["urls"]
+        blob = json.dumps(got)
+        assert "QUERYTOKEN" not in blob and "URLPASS-CANARY" not in blob and "/login" not in blob, blob
+    finally:
+        c.close()
+
+
 def test_describe_item_drops_url_userinfo():
     d, c = start(urls=["https://user:URLPASS-CANARY@bank.example/login", "bank.com/login", "https://[broken/x"])
     try:
@@ -232,6 +275,34 @@ def test_pass_cli_stderr_never_reaches_the_tool_error():
         assert (got := error(c, "describe_item", share_id="share1", item_id="item1")) == "pass-cli item failed", got
         assert (got := error(c, "list_vaults")) == "pass-cli vault failed", got
         assert len(logins(d)) == 1, calls(d)
+    finally:
+        c.close()
+
+
+def test_get_totp_reads_the_totp_field_not_another_code():
+    d, c = start()
+    op = Operator(d)
+    try:
+        write(d, "totp.json", {"pin": "999999", "totp": "123456", "otpauth": f"otpauth://totp/Bank?secret={SEED}"})
+        assert (got := c.call("get_totp", share_id="share1", item_id="item1", reason="2fa")) == {"code": "123456"}, got
+        assert "999999" not in json.dumps(got)
+    finally:
+        op.close()
+        c.close()
+
+
+def test_reason_pass_uri_is_rejected_after_normalization():
+    d, c = start()
+    try:
+        reasons = (
+            "PASS://share1/item1/pin",
+            "p\u200bass://share1/item1/pin",
+            "\uff50\uff41\uff53\uff53\uff1a\uff0f\uff0fshare/item/pin",
+        )
+        for reason in reasons:
+            got = error(c, "describe_item", share_id="share1", item_id="item1", reason=reason)
+            assert got == "reason is invalid", (reason, got)
+        assert calls(d) == [], calls(d)
     finally:
         c.close()
 
@@ -390,6 +461,27 @@ def read_tty(master, marker):
 def result(msg):
     text = msg["result"]["content"][0]["text"]
     return text if msg["result"].get("isError") else json.loads(text)
+
+
+def test_approval_prompt_caps_reason_and_argv():
+    d, c = start()
+    helper, tty = start_helper(d)
+    try:
+        read_tty(tty, b"listening")
+        reason = "R" * 400 + "REASON-TAIL"
+        arg = "A" * 1100 + "ARGV-TAIL"
+        c.send({"jsonrpc": "2.0", "id": 92, "method": "tools/call", "params": {
+            "name": "run_approved", "arguments": {"argv": ["/bin/true", arg], "env": {"PW": REF}, "reason": reason}}})
+        shown = read_tty(tty, b"denies.")
+        os.write(tty, b"no\n")
+        c.read()
+        assert "REASON-TAIL" not in shown and "ARGV-TAIL" not in shown, shown
+        assert shown.count("truncated") >= 2, shown
+    finally:
+        os.close(tty)
+        helper.kill()
+        helper.wait(timeout=5)
+        c.close()
 
 
 def test_approve_helper_shows_the_claim_on_the_tty():
