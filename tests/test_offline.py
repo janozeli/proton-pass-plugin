@@ -1,9 +1,9 @@
-import fcntl, json, os, re, select, shutil, socket, stat, subprocess, sys, termios
+import ctypes, errno, secrets, fcntl, json, os, re, select, shutil, socket, stat, subprocess, sys, termios
 from harness import (PASSWORD, PIN, SEED, SERVER, TOKEN, Operator, calls, child, error, install, server_env,
                      session, start, write)
 
 BWRAP = shutil.which("bwrap")
-SANDBOX = ["--unshare-user", "--unshare-pid", "--unshare-net", "--die-with-parent",
+SANDBOX = ["--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-net", "--die-with-parent",
            "--unsetenv", "PROTON_PASS_SESSION_DIR", "--unsetenv", "PROTON_PASS_AGENT_REASON",
            "--unsetenv", "PROTON_PASS_PERSONAL_ACCESS_TOKEN", "--unsetenv", "PASS_PAT_FILE", "--unsetenv", "PASS_CLI",
            "--unsetenv", "HOME", "--setenv", "HOME", "/tmp", "--setenv", "PATH", "/usr/bin:/bin",
@@ -141,6 +141,50 @@ def test_run_child_reaches_the_network_only_under_approve_net():
         listener.close()
         op.close()
         c.close()
+
+
+def test_run_system_v_memory_is_private_even_with_network_approval():
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.shmat.restype = ctypes.c_void_p
+    libc.shmdt.argtypes = [ctypes.c_void_p]
+    key = secrets.randbelow(0x7ffffffe) + 1
+    host_id = libc.shmget(key, 4096, 0o1000 | 0o2000 | 0o600)
+    assert host_id >= 0, ctypes.get_errno()
+    address = libc.shmat(host_id, None, 0)
+    assert address != ctypes.c_void_p(-1).value, ctypes.get_errno()
+    ctypes.memmove(address, b"host-only", 9)
+    code = r"""import ctypes,errno,os,sys
+c=ctypes.CDLL(None,use_errno=True)
+c.shmat.restype=ctypes.c_void_p
+c.shmdt.argtypes=[ctypes.c_void_p]
+key=int(sys.argv[1])
+if c.shmget(key,4096,0o600)!=-1 or ctypes.get_errno()!=errno.ENOENT: sys.exit(41)
+i=c.shmget(key,4096,0o1000|0o2000|0o600)
+if i<0: sys.exit(42)
+a=c.shmat(i,None,0)
+try:
+ if a==ctypes.c_void_p(-1).value: sys.exit(43)
+ secret=os.environ['PW'].encode()
+ ctypes.memmove(a,secret,len(secret))
+finally:
+ c.shmdt(a)
+ c.shmctl(i,0,None)
+"""
+    try:
+        for approval in ("allow", "allow-net"):
+            d, c = start()
+            op = Operator(d, {"op": approval})
+            try:
+                got = c.call("run_approved", argv=["/usr/bin/python3", "-c", code, str(key)],
+                             env={"PW": REF}, reason="check IPC isolation")
+                assert got == {"exit_code": 0}, (approval, got)
+                assert ctypes.string_at(address, 9) == b"host-only"
+            finally:
+                op.close()
+                c.close()
+    finally:
+        libc.shmdt(address)
+        assert libc.shmctl(host_id, 0, None) == 0
 
 
 def test_run_executes_a_shell_only_when_the_operator_approved_that_argv():
