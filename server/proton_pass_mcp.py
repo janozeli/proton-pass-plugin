@@ -354,12 +354,14 @@ def get_totp(a):
 
 FILL = """function(arg) {
   if (location.origin !== arg.origin) return null;
-  const shown = [...document.querySelectorAll("input")].filter(el => {
+  const eligible = el => {
     const box = el.getBoundingClientRect();
-    return !el.disabled && !el.readOnly && box.width > 0 && box.height > 0 &&
+    return el.isConnected && !el.disabled && !el.readOnly && box.width > 0 && box.height > 0 &&
       el.checkVisibility({visibilityProperty: true, opacityProperty: true});
-  });
-  const pw = shown.find(el => el.type === "password");
+  };
+  const inputs = () => [...document.querySelectorAll("input")].filter(eligible);
+  const shown = inputs();
+  let pw = shown.find(el => el.type === "password");
   if (!pw) return [];
   const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
   const set = (el, v) => {
@@ -370,10 +372,18 @@ FILL = """function(arg) {
   const before = shown.slice(0, shown.indexOf(pw)).filter(el => el.form === pw.form && ["text", "email", "tel"].includes(el.type));
   const user = before.find(el => /username|email/.test(el.autocomplete)) || before[before.length - 1];
   const filled = [];
-  if (user && arg.username) { set(user, arg.username); filled.push("username"); }
+  if (user && arg.username) {
+    set(user, arg.username);
+    if (eligible(user) && user.value === arg.username) filled.push("username");
+  }
+  // Username events may synchronously replace, hide, or disable the target.
+  pw = inputs().find(el => el.type === "password");
+  if (!pw) return [];
   set(pw, arg.password);
-  filled.push("password");
   pw.focus();
+  // Input, change, and focus handlers can also invalidate the completed fill.
+  if (!eligible(pw) || pw.type !== "password" || pw.value !== arg.password) return [];
+  filled.push("password");
   return filled;
 }"""
 
