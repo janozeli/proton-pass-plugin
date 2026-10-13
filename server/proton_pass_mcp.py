@@ -17,7 +17,7 @@ RESERVED_ENV = {"PATH", "HOME", "LD_PRELOAD", "LD_LIBRARY_PATH", "PROTON_PASS_SE
                 "PROTON_PASS_PERSONAL_ACCESS_TOKEN", "PASS_PAT_FILE", "PASS_CLI"}
 # pass-cli puts the resolved secrets in the environment it hands to bwrap, so the sandbox unsets
 # names instead of clearing the environment.
-SANDBOX = ("--unshare-user", "--unshare-pid", "--unshare-net", "--die-with-parent",
+SANDBOX = ("--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-net", "--die-with-parent",
            *(arg for name in ("PROTON_PASS_SESSION_DIR", "PROTON_PASS_AGENT_REASON", "PROTON_PASS_PERSONAL_ACCESS_TOKEN",
                               "PASS_PAT_FILE", "PASS_CLI", "HOME") for arg in ("--unsetenv", name)),
            "--setenv", "HOME", "/tmp", "--setenv", "PATH", "/usr/bin:/bin",
