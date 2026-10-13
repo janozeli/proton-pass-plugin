@@ -7,7 +7,7 @@ PAT_FILE = os.path.expanduser(os.environ.get("PASS_PAT_FILE", "~/.config/pass-ag
 REASON = "proton-pass plugin"
 AUTH_ERR = re.compile(r"requires an authenticated client|unauthori[sz]ed|session expired", re.I)
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-REF = re.compile(r"pass://([^/?#]+)/([^/?#]+)/([^/?#]+)")
+REF = re.compile(r"pass://([^/?#%]+)/([^/?#%]+)/([^/?#%]+)")
 PROTOCOL = "2025-06-18"
 SUPPORTED = {"2024-11-05", "2025-03-26", PROTOCOL}
 FORBIDDEN = {"get_secret", "run_with_secrets", "command", "url_match", "url", "username_selector",
@@ -20,7 +20,8 @@ SANDBOX = ("--unshare-user", "--unshare-net", "--die-with-parent",
            *(arg for name in ("PROTON_PASS_SESSION_DIR", "PROTON_PASS_AGENT_REASON", "PROTON_PASS_PERSONAL_ACCESS_TOKEN",
                               "PASS_PAT_FILE", "PASS_CLI", "HOME") for arg in ("--unsetenv", name)),
            "--setenv", "HOME", "/tmp", "--setenv", "PATH", "/usr/bin:/bin",
-           *(arg for path in ("/usr", "/bin", "/lib", "/lib64") for arg in ("--ro-bind-try", path, path)),
+           *(arg for path in ("/usr", "/bin", "/lib", "/lib64", "/etc/resolv.conf", "/etc/hosts",
+                              "/etc/nsswitch.conf", "/etc/ssl") for arg in ("--ro-bind-try", path, path)),
            "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--chdir", "/tmp", "--")
 APPROVAL_TIMEOUT = 180
 RUN_TIMEOUT = 300
@@ -417,7 +418,7 @@ def validate(name, args):
             raise PassError(f"{k} is invalid")
     if args.get("vault") and bad_token(args["vault"]):
         raise PassError("vault is invalid")
-    if "\x00" in args.get("reason", ""):
+    if "\x00" in args.get("reason", "") or "pass://" in args.get("reason", ""):
         raise PassError("reason is invalid")
     if args.get("limit", 0) < 0:
         raise PassError("limit must be >= 0")
@@ -451,7 +452,7 @@ TOOLS = {
     "get_totp": (get_totp, "Current TOTP code for an item, after the operator approves in the approval terminal. Returns only the digits.", ITEM, ["share_id", "item_id", "reason"]),
     "fill_login": (fill_login, "After the operator approves, type the item's username and password into the one open Chrome tab whose origin equals one of the item's saved websites. The password never comes back. submit presses Enter; submitted means Enter was pressed, not that the login worked.",
                    {**ITEM, "submit": {"type": "boolean"}}, ["share_id", "item_id", "reason"]),
-    "run_approved": (run_approved, "After the operator approves this exact argv, run it in a bubblewrap sandbox with pass://SHARE_ID/ITEM_ID/FIELD references injected as environment variables. The sandbox sees only /usr, /bin and /lib read-only and an empty /tmp, and has no network unless the operator allows it. Output is discarded. Returns only the exit code.",
+    "run_approved": (run_approved, "After the operator approves this exact argv, run it in a bubblewrap sandbox with pass://SHARE_ID/ITEM_ID/FIELD references injected as environment variables. The sandbox sees /usr, /bin, and /lib read-only, /etc name-service and TLS files, and an empty /tmp. It has no network unless the operator allows it. Output is discarded. Returns only the exit code.",
                      {"argv": {"type": "array", "items": S, "description": "Absolute path of the program, then its arguments. No shell is added."},
                       "env": {"type": "object", "additionalProperties": S, "description": "Variable name to pass://SHARE_ID/ITEM_ID/FIELD reference."},
                       "reason": WHY}, ["argv", "env", "reason"]),

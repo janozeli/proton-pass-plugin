@@ -8,8 +8,10 @@ SANDBOX = ["--unshare-user", "--unshare-net", "--die-with-parent",
            "--unsetenv", "PROTON_PASS_PERSONAL_ACCESS_TOKEN", "--unsetenv", "PASS_PAT_FILE", "--unsetenv", "PASS_CLI",
            "--unsetenv", "HOME", "--setenv", "HOME", "/tmp", "--setenv", "PATH", "/usr/bin:/bin",
            "--ro-bind-try", "/usr", "/usr", "--ro-bind-try", "/bin", "/bin", "--ro-bind-try", "/lib", "/lib",
-           "--ro-bind-try", "/lib64", "/lib64", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--chdir", "/tmp",
-           "--"]
+           "--ro-bind-try", "/lib64", "/lib64", "--ro-bind-try", "/etc/resolv.conf", "/etc/resolv.conf",
+           "--ro-bind-try", "/etc/hosts", "/etc/hosts", "--ro-bind-try", "/etc/nsswitch.conf", "/etc/nsswitch.conf",
+           "--ro-bind-try", "/etc/ssl", "/etc/ssl", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+           "--chdir", "/tmp", "--"]
 NET_SANDBOX = [a for a in SANDBOX if a != "--unshare-net"]
 REF = "pass://share1/item1/pin"
 FORBIDDEN = {"get_secret", "run_with_secrets", "command", "url_match", "url", "username_selector",
@@ -183,7 +185,8 @@ def test_run_rejects_relative_argv_reserved_names_and_literal_values():
             ({"argv": ["/bin/true"], "env": {"BAD-NAME": REF}}, "invalid env name BAD-NAME"),
             *(({"argv": ["/bin/true"], "env": {"PW": ref}}, "env PW must be a pass://SHARE_ID/ITEM_ID/FIELD reference")
               for ref in ("pass://share1/item1/password?totp=uri", "pass://share1/item1/pin#x",
-                          "pass://share1/item1/pin/extra", "pass://share1//pin", "pass://share1/item1/-pin")),
+                          "pass://share1/item1/pin/extra", "pass://share1//pin", "pass://share1/item1/-pin",
+                          "pass://share1/item1/password%3Ftotp=uri", "pass://share1/item1/%2Dpin")),
         )
         for args, want in cases:
             got = error(c, "run_approved", reason="r", **args)
@@ -320,6 +323,27 @@ def test_open_session_dir_we_own_becomes_0700_and_a_second_start_adopts_it():
             assert (mode := stat.S_IMODE(os.stat(session(d)).st_mode)) == 0o700, oct(mode)
         finally:
             c.close()
+
+
+def test_reason_containing_pass_uri_never_reaches_pass_cli():
+    d, c = start()
+    op = Operator(d)
+    try:
+        reason = "pass://share1/item1/password?totp=uri"
+        cases = (
+            ("describe_item", {"share_id": "share1", "item_id": "item1", "reason": reason}),
+            ("describe_item", {"share_id": "share1", "item_id": "item1", "reason": "see pass://share1/item1/pin"}),
+            ("get_totp", {"share_id": "share1", "item_id": "item1", "reason": reason}),
+            ("fill_login", {"share_id": "share1", "item_id": "item1", "reason": reason}),
+            ("run_approved", {"argv": ["/bin/true"], "env": {"PW": REF}, "reason": reason}),
+        )
+        for name, args in cases:
+            got = error(c, name, **args)
+            assert got == "reason is invalid", (name, got)
+        assert calls(d) == [] and op.prompts == [], (calls(d), op.prompts)
+    finally:
+        op.close()
+        c.close()
 
 
 def test_leading_dash_ids_and_vaults_never_reach_pass_cli():
