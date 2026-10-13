@@ -187,6 +187,58 @@ def test_fill_skips_disabled_and_inert_ancestors(lab):
 <input id=huser autocomplete=username><input id=hpw type=password></div></{tag}>""")
 
 
+def test_fill_accepts_modal_dialog_inside_inert_ancestor(lab):
+    d, c = server(lab)
+    op = Operator(d)
+    try:
+        with tab(lab, "/login.html") as page:
+            page.set_content("""<div inert><dialog><form>
+<input id=user autocomplete=username><input id=pw type=password>
+</form></dialog></div>""")
+            page.eval_on_selector("dialog", "e => e.showModal()")
+            page.click("#pw")
+            assert page.eval_on_selector("#pw", "e => e === document.activeElement")
+            assert c.call("fill_login", **ITEM) == {"filled": ["username", "password"], "submitted": False}
+            assert [value(page, s) for s in ("#user", "#pw")] == ["ada", PASSWORD]
+    finally:
+        op.close()
+        c.close()
+
+
+def test_fill_rejects_explicit_inertness_within_modal_dialog(lab):
+    d, c = server(lab)
+    op = Operator(d)
+    try:
+        for selector in ("dialog", "form", "input"):
+            with tab(lab, "/login.html") as page:
+                page.set_content("""<div inert><dialog><form>
+<input id=user autocomplete=username><input id=pw type=password>
+</form></dialog></div>""")
+                page.eval_on_selector_all(selector, "els => els.forEach(e => e.inert = true)")
+                page.eval_on_selector("dialog", "e => e.showModal()")
+                assert error(c, "fill_login", **ITEM) == "no password field on the matching tab", selector
+                assert [value(page, s) for s in ("#user", "#pw")] == ["", ""], selector
+    finally:
+        op.close()
+        c.close()
+
+
+def test_fill_rejects_nonmodal_dialog_inside_inert_ancestor(lab):
+    d, c = server(lab)
+    op = Operator(d)
+    try:
+        with tab(lab, "/login.html") as page:
+            page.set_content("""<div inert><dialog><form>
+<input id=user autocomplete=username><input id=pw type=password>
+</form></dialog></div>""")
+            page.eval_on_selector("dialog", "e => e.show()")
+            assert error(c, "fill_login", **ITEM) == "no password field on the matching tab"
+            assert [value(page, s) for s in ("#user", "#pw")] == ["", ""]
+    finally:
+        op.close()
+        c.close()
+
+
 def test_fill_reselects_password_when_username_events_disable_its_ancestor(lab):
     d, c = server(lab)
     op = Operator(d)
