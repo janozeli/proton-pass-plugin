@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-import http.client, json, os, re, shutil, signal, socket, stat, struct, subprocess, sys, termios
-from urllib.parse import urlsplit, urlunsplit
+import http.client, json, os, re, shutil, signal, socket, stat, struct, subprocess, sys, termios, unicodedata
+from urllib.parse import urlsplit
 
 PASS_CLI = os.path.expanduser(os.environ.get("PASS_CLI", "~/.local/bin/pass-cli"))
 PAT_FILE = os.path.expanduser(os.environ.get("PASS_PAT_FILE", "~/.config/pass-agent/pat"))
@@ -16,7 +16,7 @@ RESERVED_ENV = {"PATH", "HOME", "LD_PRELOAD", "LD_LIBRARY_PATH", "PROTON_PASS_SE
                 "PROTON_PASS_PERSONAL_ACCESS_TOKEN", "PASS_PAT_FILE", "PASS_CLI"}
 # pass-cli puts the resolved secrets in the environment it hands to bwrap, so the sandbox unsets
 # names instead of clearing the environment.
-SANDBOX = ("--unshare-user", "--unshare-net", "--die-with-parent",
+SANDBOX = ("--unshare-user", "--unshare-pid", "--unshare-net", "--die-with-parent",
            *(arg for name in ("PROTON_PASS_SESSION_DIR", "PROTON_PASS_AGENT_REASON", "PROTON_PASS_PERSONAL_ACCESS_TOKEN",
                               "PASS_PAT_FILE", "PASS_CLI", "HOME") for arg in ("--unsetenv", name)),
            "--setenv", "HOME", "/tmp", "--setenv", "PATH", "/usr/bin:/bin",
@@ -25,6 +25,18 @@ SANDBOX = ("--unshare-user", "--unshare-net", "--die-with-parent",
            "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--chdir", "/tmp", "--")
 APPROVAL_TIMEOUT = 180
 RUN_TIMEOUT = 300
+REASON_LIMIT = 300
+ARGV_LIMIT = 1024
+RENAME = (
+    "import json,os,sys\n"
+    "keep={'PATH','HOME','PWD'}\n"
+    "for src,dst in json.loads(sys.argv[1]):\n"
+    " os.environ[dst]=os.environ.pop(src)\n"
+    " keep.add(dst)\n"
+    "for name in list(os.environ):\n"
+    " if name not in keep: del os.environ[name]\n"
+    "os.execv(sys.argv[2],sys.argv[2:])\n"
+)
 SESSION = None
 
 
@@ -136,15 +148,15 @@ def browser_origin(url):
     return f"{u.scheme}://{host}" + (f":{port}" if port not in (None, default) else "")
 
 
-def public_url(url):
-    try:
-        u = urlsplit(url if "://" in url else "https://" + url)
-        port = u.port
-    except ValueError:
-        return None
-    if not u.hostname:
-        return None
-    return urlunsplit((u.scheme, _host(u) + (f":{port}" if port else ""), u.path, u.query, u.fragment))
+def reason_key(value):
+    text = unicodedata.normalize("NFKC", value)
+    return "".join(ch for ch in text if unicodedata.category(ch) != "Cf").casefold()
+
+
+def shown(value, limit):
+    if len(value) <= limit:
+        return repr(value)
+    return repr(value[:limit]) + f" (truncated, {len(value)} characters)"
 
 
 def peer_uid(sock):
@@ -176,14 +188,14 @@ def render(p):
         raise ValueError("unknown action")
     lines = ["proton-pass release request", f"  action:  {p['action']}"]
     if p["action"] == "run":
-        lines.append("  argv:    " + "\n           ".join(repr(a) for a in p["argv"]))
+        lines.append("  argv:    " + "\n           ".join(shown(a, ARGV_LIMIT) for a in p["argv"]))
         lines.append("  env:     " + "\n           ".join(f"{n!r} = {r!r} (field {f!r} of {t!r})" for n, r, t, f in p["env"]))
         lines.append("  network: off (type approve-net to allow it)")
     else:
         lines.append(f"  item:    {p['title']!r}")
     if p["action"] == "fill":
         lines += [f"  origin:  {p['origin']!r}", f"  submit:  {p['submit']!r}"]
-    lines += [f"  reason:  {p['reason']!r}", "Type approve to release. Anything else denies."]
+    lines += [f"  reason:  {shown(p['reason'], REASON_LIMIT)}", "Type approve to release. Anything else denies."]
     return "\n".join(lines)
 
 
@@ -248,7 +260,7 @@ def describe_item(a):
     return {
         "title": c["title"], "share_id": it["share_id"], "item_id": it["id"],
         "type": next(iter(c["content"])) if isinstance(c["content"], dict) else c["content"],
-        "urls": [u for u in map(public_url, lg.get("urls", [])) if u],
+        "urls": [u for u in map(browser_origin, lg.get("urls", [])) if u],
         "username": lg.get("username", ""), "email": lg.get("email", ""),
         "has_password": bool(lg.get("password")), "has_totp": bool(lg.get("totp_uri")),
         "extra_field_names": [f.get("name") for f in c.get("extra_fields", [])],
@@ -259,36 +271,44 @@ def describe_item(a):
 def get_totp(a):
     release({"action": "totp", "title": view_item(a)["content"]["title"], "reason": a["reason"]})
     data = cli_json("item", "totp", *item_args(a), reason=a["reason"])
-    codes = [v for v in data.values() if isinstance(v, str) and re.fullmatch(r"[0-9]{6,8}", v)]
-    if not codes:
+    code = data.get("totp")
+    if not isinstance(code, str) or not re.fullmatch(r"[0-9]{6,8}", code):
         raise PassError("item has no TOTP code")
-    return {"code": codes[0]}
+    return {"code": code}
 
 
-FILL = """({origin, username, password}) => {
-  if (location.origin !== origin) return null;
+FILL = """function(arg) {
+  if (location.origin !== arg.origin) return null;
+  const shown = [...document.querySelectorAll("input")].filter(el => !el.disabled && !el.readOnly && el.checkVisibility({visibilityProperty: true}));
+  const pw = shown.find(el => el.type === "password");
+  if (!pw) return [];
+  if (arg.submit) {
+    let actionOrigin;
+    try { actionOrigin = new URL(pw.form ? pw.form.action : location.href, location.href).origin; }
+    catch (e) { return "bad-action"; }
+    if (actionOrigin !== arg.origin) return "bad-action";
+  }
   const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
   const set = (el, v) => {
     setter.call(el, v);
     el.dispatchEvent(new Event("input", {bubbles: true}));
     el.dispatchEvent(new Event("change", {bubbles: true}));
   };
-  const shown = [...document.querySelectorAll("input")].filter(el => !el.disabled && !el.readOnly && el.checkVisibility({visibilityProperty: true}));
-  const pw = shown.find(el => el.type === "password");
-  if (!pw) return [];
   const before = shown.slice(0, shown.indexOf(pw)).filter(el => el.form === pw.form && ["text", "email", "tel"].includes(el.type));
   const user = before.find(el => /username|email/.test(el.autocomplete)) || before[before.length - 1];
   const filled = [];
-  if (user && username) { set(user, username); filled.push("username"); }
-  set(pw, password);
+  if (user && arg.username) { set(user, arg.username); filled.push("username"); }
+  set(pw, arg.password);
   filled.push("password");
   pw.focus();
   return filled;
 }"""
 
-CLEAR = """(origin) => {
-  if (location.origin === origin) return;
-  for (const el of document.querySelectorAll("input[type=password]")) el.value = "";
+CLEAR = """function(arg) {
+  if (location.origin === arg.origin) return;
+  for (const el of document.querySelectorAll("input, textarea")) {
+    if (el.type === "password" || (arg.password && String(el.value).includes(arg.password))) el.value = "";
+  }
 }"""
 
 
@@ -338,20 +358,41 @@ def fill_login(a):
             page, allowed = hits[0], browser_origin(hits[0].url)
             release({"action": "fill", "title": item["content"]["title"], "origin": allowed, "submit": submit,
                      "reason": a["reason"]})
-            got = page.evaluate(FILL, {"origin": allowed, "username": lg.get("username") or lg.get("email") or "",
-                                       "password": lg["password"]})
+            secret = {"origin": allowed, "username": lg.get("username") or lg.get("email") or "",
+                      "password": lg["password"], "submit": submit}
+            got = isolated(page, FILL, secret)
             if got is None:
                 raise PassError(f"no open tab matches this item's websites ({len(pages)} tabs open)")
+            if got == "bad-action":
+                raise PassError("form action origin does not match")
             filled = [f for f in ("username", "password") if isinstance(got, list) and f in got]
             if not filled:
                 raise PassError("no password field on the matching tab")
             if submit:
                 page.keyboard.press("Enter")
                 page.wait_for_timeout(1000)
-                page.evaluate(CLEAR, allowed)
+                isolated(page, CLEAR, secret)
         finally:
             browser.close()
     return {"filled": filled, "submitted": submit}
+
+
+def isolated(page, source, arg):
+    try:
+        session = page.context.new_cdp_session(page)
+        frame = session.send("Page.getFrameTree")["frameTree"]["frame"]["id"]
+        world = session.send("Page.createIsolatedWorld", {"frameId": frame, "worldName": "proton-pass"})
+        result = session.send("Runtime.callFunctionOn", {
+            "functionDeclaration": source,
+            "executionContextId": world["executionContextId"],
+            "arguments": [{"value": arg}],
+            "returnByValue": True,
+        })
+    except (OSError, KeyError, TypeError):
+        raise PassError("internal error")
+    if result.get("exceptionDetails") is not None:
+        raise PassError("internal error")
+    return result.get("result", {}).get("value")
 
 
 def ref_parts(ref):
@@ -364,14 +405,17 @@ def run_approved(a):
     if not bwrap:
         raise PassError("bwrap is not installed")
     argv, env = tuple(a["argv"]), dict(a["env"])
-    shown = []
-    for name, ref in env.items():
+    shown, bindings = [], []
+    for index, (name, ref) in enumerate(env.items()):
         share, item, field = ref_parts(ref)
         shown.append([name, ref, view_item({"share_id": share, "item_id": item})["content"]["title"], field])
+        bindings.append((f"PP{index}", name, ref))
     op = release({"action": "run", "argv": list(argv), "env": shown, "reason": a["reason"]})
     sandbox = SANDBOX if op == "allow" else tuple(arg for arg in SANDBOX if arg != "--unshare-net")
+    launch = ["/usr/bin/python3", "-c", RENAME, json.dumps([[src, dst] for src, dst, _ in bindings])]
     try:
-        p = subprocess.Popen([PASS_CLI, "run", "--", bwrap, *sandbox, *argv], env=cli_env(REASON, env),
+        p = subprocess.Popen([PASS_CLI, "run", "--", bwrap, *sandbox, *launch, *argv],
+                             env=cli_env(REASON, {src: ref for src, _, ref in bindings}),
                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                              start_new_session=True)
     except OSError:
@@ -418,7 +462,7 @@ def validate(name, args):
             raise PassError(f"{k} is invalid")
     if args.get("vault") and bad_token(args["vault"]):
         raise PassError("vault is invalid")
-    if "\x00" in args.get("reason", "") or "pass://" in args.get("reason", ""):
+    if "\x00" in args.get("reason", "") or "pass://" in reason_key(args.get("reason", "")):
         raise PassError("reason is invalid")
     if args.get("limit", 0) < 0:
         raise PassError("limit must be >= 0")
@@ -435,7 +479,7 @@ def validate(name, args):
         for k, ref in args["env"].items():
             if not ENV_NAME.fullmatch(k):
                 raise PassError(f"invalid env name {k}")
-            if k in RESERVED_ENV:
+            if k in RESERVED_ENV or re.fullmatch(r"PP\d+", k):
                 raise PassError(f"env name {k} is reserved")
             if not ref_parts(ref):
                 raise PassError(f"env {k} must be a pass://SHARE_ID/ITEM_ID/FIELD reference")
@@ -448,8 +492,8 @@ TOOLS = {
     "list_vaults": (list_vaults, "List Proton Pass vaults (names and ids).", {}, []),
     "search_items": (search_items, "Search items by title (case-insensitive substring). Metadata only, no secrets.",
                      {"query": S, "vault": S, "type": {"type": "string", "enum": ["login", "note", "alias", "credit-card", "identity", "ssh-key", "wifi", "custom"]}, "limit": {"type": "integer"}}, []),
-    "describe_item": (describe_item, "Item metadata: website URLs without credentials, username, email, has_password, has_totp, extra field names. No secret values.", ITEM, ["share_id", "item_id"]),
-    "get_totp": (get_totp, "Current TOTP code for an item, after the operator approves in the approval terminal. Returns only the digits.", ITEM, ["share_id", "item_id", "reason"]),
+    "describe_item": (describe_item, "Item metadata: website origins (scheme, host, and port only), username, email, has_password, has_totp, extra field names. No path, query, fragment, or secret values.", ITEM, ["share_id", "item_id"]),
+    "get_totp": (get_totp, "Current TOTP code from the item's totp field, after the operator approves in the approval terminal. Returns only the digits.", ITEM, ["share_id", "item_id", "reason"]),
     "fill_login": (fill_login, "After the operator approves, type the item's username and password into the one open Chrome tab whose origin equals one of the item's saved websites. The password never comes back. submit presses Enter; submitted means Enter was pressed, not that the login worked.",
                    {**ITEM, "submit": {"type": "boolean"}}, ["share_id", "item_id", "reason"]),
     "run_approved": (run_approved, "After the operator approves this exact argv, run it in a bubblewrap sandbox with pass://SHARE_ID/ITEM_ID/FIELD references injected as environment variables. The sandbox sees /usr, /bin, and /lib read-only, /etc name-service and TLS files, and an empty /tmp. It has no network unless the operator allows it. Output is discarded. Returns only the exit code.",

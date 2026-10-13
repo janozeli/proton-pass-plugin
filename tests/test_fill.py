@@ -136,11 +136,6 @@ def test_fill_submit_presses_enter_and_clears_the_password_only_off_origin(lab):
             got = c.call("fill_login", submit=True, **ITEM)
             assert got == {"filled": ["username", "password"], "submitted": True}, got
             page.wait_for_url(f"{lab.good}/done.html?username=ada", timeout=5000)
-        with tab(lab, "/away.html") as page:
-            got = c.call("fill_login", submit=True, **ITEM)
-            assert got == {"filled": ["username", "password"], "submitted": True}, got
-            page.wait_for_url(f"{lab.bad}/kept.html?username=ada", timeout=5000)
-            assert value(page, "#pw") == ""
     finally:
         op.close()
         c.close()

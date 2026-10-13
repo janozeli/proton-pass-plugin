@@ -3,7 +3,7 @@ from harness import (PASSWORD, PIN, SEED, SERVER, TOKEN, Operator, calls, child,
                      session, start, write)
 
 BWRAP = shutil.which("bwrap")
-SANDBOX = ["--unshare-user", "--unshare-net", "--die-with-parent",
+SANDBOX = ["--unshare-user", "--unshare-pid", "--unshare-net", "--die-with-parent",
            "--unsetenv", "PROTON_PASS_SESSION_DIR", "--unsetenv", "PROTON_PASS_AGENT_REASON",
            "--unsetenv", "PROTON_PASS_PERSONAL_ACCESS_TOKEN", "--unsetenv", "PASS_PAT_FILE", "--unsetenv", "PASS_CLI",
            "--unsetenv", "HOME", "--setenv", "HOME", "/tmp", "--setenv", "PATH", "/usr/bin:/bin",
@@ -14,6 +14,21 @@ SANDBOX = ["--unshare-user", "--unshare-net", "--die-with-parent",
            "--chdir", "/tmp", "--"]
 NET_SANDBOX = [a for a in SANDBOX if a != "--unshare-net"]
 REF = "pass://share1/item1/pin"
+RENAME = (
+    "import json,os,sys\n"
+    "keep={'PATH','HOME','PWD'}\n"
+    "for src,dst in json.loads(sys.argv[1]):\n"
+    " os.environ[dst]=os.environ.pop(src)\n"
+    " keep.add(dst)\n"
+    "for name in list(os.environ):\n"
+    " if name not in keep: del os.environ[name]\n"
+    "os.execv(sys.argv[2],sys.argv[2:])\n"
+)
+
+
+def launch(argv, names):
+    mapping = [[f"PP{i}", name] for i, name in enumerate(names)]
+    return ["/usr/bin/python3", "-c", RENAME, json.dumps(mapping), *argv]
 FORBIDDEN = {"get_secret", "run_with_secrets", "command", "url_match", "url", "username_selector",
              "password_selector", "cdp_port", "cwd", "value", "password", "totp_uri"}
 
@@ -93,10 +108,10 @@ def test_run_child_has_no_network_and_no_host_secrets_under_approve():
         assert PIN not in json.dumps(got), got
         assert op.prompts == [{"action": "run", "argv": argv, "env": [["PW", REF, "Bank", "pin"]],
                                "reason": "deploy"}], op.prompts
-        assert runs(d) == [["run", "--", BWRAP, *SANDBOX, *argv]], runs(d)
+        assert runs(d) == [["run", "--", BWRAP, *SANDBOX, *launch(argv, ["PW"])]], runs(d)
         cli_env = json.load(open(os.path.join(d, "run-env.json")))
         assert cli_env == {"PATH": os.environ["PATH"], "PROTON_PASS_SESSION_DIR": session(d),
-                           "PROTON_PASS_AGENT_REASON": "proton-pass plugin", "PW": REF}, cli_env
+                           "PROTON_PASS_AGENT_REASON": "proton-pass plugin", "PP0": REF}, cli_env
         assert (fds := json.load(open(os.path.join(d, "run-fds.json")))) == ["/dev/null"] * 3, fds
         try:
             listener.accept()
@@ -118,7 +133,7 @@ def test_run_child_reaches_the_network_only_under_approve_net():
     try:
         argv, want = child(d, listener.getsockname()[1])
         assert (got := c.call("run_approved", argv=argv, env={"PW": REF}, reason="deploy")) == {"exit_code": 9}, got
-        assert runs(d) == [["run", "--", BWRAP, *NET_SANDBOX, *argv]], runs(d)
+        assert runs(d) == [["run", "--", BWRAP, *NET_SANDBOX, *launch(argv, ["PW"])]], runs(d)
         conn, _ = listener.accept()
         with conn:
             assert (seen := json.loads(conn.makefile().read())) == want, seen
@@ -134,7 +149,7 @@ def test_run_executes_a_shell_only_when_the_operator_approved_that_argv():
     try:
         assert (got := c.call("run_approved", argv=["/bin/sh", "-c", "exit 3"], env={"PW": REF}, reason="r")) == {"exit_code": 3}, got
         assert op.prompts[0]["argv"] == ["/bin/sh", "-c", "exit 3"], op.prompts
-        assert runs(d) == [["run", "--", BWRAP, *SANDBOX, "/bin/sh", "-c", "exit 3"]], runs(d)
+        assert runs(d) == [["run", "--", BWRAP, *SANDBOX, *launch(["/bin/sh", "-c", "exit 3"], ["PW"])]], runs(d)
     finally:
         op.close()
         c.close()
@@ -153,7 +168,7 @@ def test_run_fails_closed_and_ignores_an_argv_in_the_reply():
         op = Operator(d, {"op": "allow", "argv": ["/bin/sh", "-c", f"touch {pwned}"]})
         assert (got := c.call("run_approved", argv=argv, env={"PW": REF}, reason="r")) == {"exit_code": 7}, got
         op.close()
-        assert runs(d) == [["run", "--", BWRAP, *SANDBOX, *argv]], runs(d)
+        assert runs(d) == [["run", "--", BWRAP, *SANDBOX, *launch(argv, ["PW"])]], runs(d)
         assert not os.path.exists(pwned)
     finally:
         c.close()
@@ -244,7 +259,7 @@ def test_describe_item_drops_url_userinfo():
     d, c = start(urls=["https://user:URLPASS-CANARY@bank.example/login", "bank.com/login", "https://[broken/x"])
     try:
         got = c.call("describe_item", share_id="share1", item_id="item1", reason="r")
-        assert got["urls"] == ["https://bank.example/login", "https://bank.com/login"], got["urls"]
+        assert got["urls"] == ["https://bank.example", "https://bank.com"], got["urls"]
     finally:
         c.close()
 
@@ -545,7 +560,7 @@ def test_search_and_describe_return_metadata_only():
         got = c.call("describe_item", share_id="share1", item_id="item1", reason="offline test")
         assert got == {
             "title": "Bank", "share_id": "share1", "item_id": "item1", "type": "Login",
-            "urls": ["https://bank.com/login"], "username": "ada", "email": "ada@example.com",
+            "urls": ["https://bank.com"], "username": "ada", "email": "ada@example.com",
             "has_password": True, "has_totp": True, "extra_field_names": ["api"], "has_note": True,
         }, got
     finally:
