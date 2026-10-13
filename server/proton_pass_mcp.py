@@ -201,7 +201,9 @@ def render(p):
         raise ValueError("unknown action")
     lines = ["proton-pass release request", f"  action:  {p['action']}"]
     if p["action"] == "run":
-        lines.append("  argv:    " + "\n           ".join(shown(a, ARGV_LIMIT) for a in p["argv"]))
+        if any(len(a) > ARGV_LIMIT for a in p["argv"]):
+            raise ValueError("argv exceeds the display limit")
+        lines.append("  argv:    " + "\n           ".join(repr(a) for a in p["argv"]))
         lines.append("  env:     " + "\n           ".join(f"{n!r} = {r!r} (field {f!r} of {t!r})" for n, r, t, f in p["env"]))
         lines.append("  network: off (type approve-net to allow it)")
     else:
@@ -484,6 +486,8 @@ def validate(name, args):
             raise PassError("argv must not be empty")
         if not os.path.isabs(args["argv"][0]):
             raise PassError("argv[0] must be an absolute path")
+        if any(len(part) > ARGV_LIMIT for part in args["argv"]):
+            raise PassError(f"argv arguments must be at most {ARGV_LIMIT} characters")
         if any("\x00" in part for part in args["argv"]):
             raise PassError("argv is invalid")
     if "env" in args:
