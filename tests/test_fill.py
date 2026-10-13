@@ -1,7 +1,11 @@
-import contextlib, http.server, json, os, socket, subprocess, tempfile, threading, time, urllib.request
+import contextlib, http.server, json, os, socket, subprocess, sys, tempfile, threading, time, urllib.request
 from types import SimpleNamespace
 from playwright.sync_api import sync_playwright
 from harness import PASSWORD, Operator, error, start, write
+from mcp_client import ROOT
+
+sys.path.insert(0, os.path.join(ROOT, "server"))
+from proton_pass_mcp import isolated_fill
 
 PAGES = {
     "login.html": """<form id=search><input id=q name=q></form>
@@ -185,6 +189,83 @@ def test_fill_skips_disabled_and_inert_ancestors(lab):
         tag = wrapper.split()[0]
         assert_fill_skips_transparent_fields(lab, f"""<{wrapper}><div>
 <input id=huser autocomplete=username><input id=hpw type=password></div></{tag}>""")
+
+
+def test_fill_never_writes_into_timer_flipping_stacked_modals(lab):
+    with tab(lab, "/login.html") as page:
+        page.set_content("""<dialog id=lower><input type=password></dialog>
+<dialog id=upper><input type=password></dialog>""")
+        page.evaluate("""() => {
+          window.writes = [];
+          for (const input of document.querySelectorAll('input')) {
+            input.addEventListener('input', function() {
+              this.focus({preventScroll: true});
+              writes.push({focused: document.activeElement === this, value: this.value});
+            });
+          }
+          lower.showModal(); upper.showModal();
+          let next = lower;
+          window.flips = 0;
+          window.flipper = setInterval(() => {
+            next.close(); next.showModal();
+            next = next === lower ? upper : lower;
+            flips++;
+          }, 8);
+        }""")
+        try:
+            for _ in range(100):
+                isolated_fill(page, {"origin": lab.good, "username": "", "password": PASSWORD})
+        finally:
+            page.evaluate("clearInterval(flipper)")
+        writes = page.evaluate("writes")
+        assert page.evaluate("flips") > 0
+        assert writes, "must exercise actual credential writes"
+        refused = [entry for entry in writes if not entry["focused"] and entry["value"] == PASSWORD]
+        assert not refused, f"{len(refused)} of {len(writes)} password writes reached inert controls"
+
+
+def test_fill_skips_inputs_slotted_through_closed_inert_shadow_root(lab):
+    with tab(lab, "/login.html") as page:
+        page.set_content("""<div id=host><input id=huser autocomplete=username>
+<input id=hpw type=password></div>
+<form><input id=user><input id=pw type=password></form>""")
+        page.evaluate("host.attachShadow({mode:'closed'}).innerHTML = '<div inert><slot></slot></div>'")
+        assert page.evaluate("huser.assignedSlot === null && hpw.assignedSlot === null")
+        assert page.evaluate("hpw.focus(); document.activeElement !== hpw")
+        got = isolated_fill(page, {"origin": lab.good, "username": "ada", "password": PASSWORD})
+        assert [value(page, s) for s in ("#huser", "#hpw")] == ["", ""]
+        assert got == ["username", "password"]
+        assert [value(page, s) for s in ("#user", "#pw")] == ["ada", PASSWORD]
+
+
+def test_fill_skips_css_inert_controls(lab):
+    assert_fill_skips_transparent_fields(lab, """<div style="interactivity: inert">
+<input id=huser autocomplete=username><input id=hpw type=password></div>""")
+
+
+def test_fill_checks_deep_focus_in_nested_shadow_roots(lab):
+    for mode in ("open", "closed"):
+        with tab(lab, "/login.html") as page:
+            page.set_content('<div id=host></div>')
+            page.evaluate("""mode => {
+              const outer = host.attachShadow({mode});
+              outer.innerHTML = '<div id=inner></div>';
+              window.loginRoot = outer.querySelector('#inner').attachShadow({mode});
+              loginRoot.innerHTML = '<form><input id=user><input id=pw type=password></form>';
+            }""", mode)
+            got = isolated_fill(page, {"origin": lab.good, "username": "ada", "password": PASSWORD})
+            assert got == ["username", "password"], (mode, got)
+            assert page.evaluate("[loginRoot.querySelector('#user').value, loginRoot.querySelector('#pw').value]") == ["ada", PASSWORD]
+            assert page.evaluate("loginRoot.activeElement === loginRoot.querySelector('#pw')")
+
+
+def test_fill_refuses_credentials_when_focus_is_redirected(lab):
+    for field in ("user", "pw"):
+        with tab(lab, "/login.html") as page:
+            page.set_content('<button id=sink>Elsewhere</button><form><input id=user><input id=pw type=password></form>')
+            page.eval_on_selector('#' + field, "el => el.onfocus = () => sink.focus()")
+            isolated_fill(page, {"origin": lab.good, "username": "ada", "password": PASSWORD})
+            assert value(page, '#' + field) == "", field
 
 
 def test_fill_accepts_modal_dialog_inside_inert_ancestor(lab):
