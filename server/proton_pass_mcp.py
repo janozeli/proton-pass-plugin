@@ -354,7 +354,11 @@ def get_totp(a):
 
 FILL = """function(arg) {
   if (location.origin !== arg.origin) return null;
-  const shown = [...document.querySelectorAll("input")].filter(el => !el.disabled && !el.readOnly && el.checkVisibility({visibilityProperty: true, opacityProperty: true}));
+  const shown = [...document.querySelectorAll("input")].filter(el => {
+    const box = el.getBoundingClientRect();
+    return !el.disabled && !el.readOnly && box.width > 0 && box.height > 0 &&
+      el.checkVisibility({visibilityProperty: true, opacityProperty: true});
+  });
   const pw = shown.find(el => el.type === "password");
   if (!pw) return [];
   const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
