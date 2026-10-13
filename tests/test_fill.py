@@ -180,6 +180,61 @@ def test_fill_skips_inputs_without_positive_dimensions(lab):
 <input id=hpw type=password style="{size};padding:0;border:0">""")
 
 
+def test_fill_skips_disabled_and_inert_ancestors(lab):
+    for wrapper in ("fieldset disabled", "div inert"):
+        tag = wrapper.split()[0]
+        assert_fill_skips_transparent_fields(lab, f"""<{wrapper}><div>
+<input id=huser autocomplete=username><input id=hpw type=password></div></{tag}>""")
+
+
+def test_fill_reselects_password_when_username_events_disable_its_ancestor(lab):
+    d, c = server(lab)
+    op = Operator(d)
+    try:
+        for attribute in ("disabled", "inert"):
+            for event in ("input", "change"):
+                with tab(lab, "/login.html") as page:
+                    page.set_content(f"""<form><input id=user
+on{event}="document.querySelector('fieldset').setAttribute('{attribute}', '')">
+<fieldset><input id=oldpw type=password></fieldset><input id=pw type=password></form>""")
+                    got = c.call("fill_login", **ITEM)
+                    assert got == {"filled": ["username", "password"], "submitted": False}, (attribute, event, got)
+                    assert value(page, "#oldpw") == "", (attribute, event)
+                    assert value(page, "#pw") == PASSWORD, (attribute, event)
+    finally:
+        op.close()
+        c.close()
+
+
+def test_fill_does_not_report_password_with_ancestor_disabled_during_its_events(lab):
+    d, c = server(lab)
+    op = Operator(d)
+    try:
+        for attribute in ("disabled", "inert"):
+            for event in ("input", "change", "focus"):
+                with tab(lab, "/login.html") as page:
+                    page.set_content(f"""<form><input id=user><fieldset><input id=pw type=password
+on{event}="this.parentElement.setAttribute('{attribute}', '')"></fieldset></form>""")
+                    assert error(c, "fill_login", **ITEM) == "no password field on the matching tab", (attribute, event)
+    finally:
+        op.close()
+        c.close()
+
+
+def test_fill_accepts_inputs_in_first_legend_of_disabled_fieldset(lab):
+    d, c = server(lab)
+    op = Operator(d)
+    try:
+        with tab(lab, "/login.html") as page:
+            page.set_content("""<form><fieldset disabled><legend>
+<input id=user><input id=pw type=password></legend><input id=hpw type=password></fieldset></form>""")
+            assert c.call("fill_login", **ITEM) == {"filled": ["username", "password"], "submitted": False}
+            assert [value(page, s) for s in ("#user", "#pw", "#hpw")] == ["ada", PASSWORD, ""]
+    finally:
+        op.close()
+        c.close()
+
+
 def test_fill_reselects_password_replaced_by_username_events(lab):
     d, c = server(lab)
     op = Operator(d)
