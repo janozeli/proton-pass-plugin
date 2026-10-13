@@ -42,6 +42,7 @@ if os.path.exists(path("stderr")):
     finish(err=open(path("stderr")).read(), code=1)
 if args[:2] == ["run", "--"]:
     json.dump(env, open(path("run-env.json"), "w"))
+    json.dump([os.readlink(f"/proc/self/fd/{n}") for n in range(3)], open(path("run-fds.json"), "w"))
     secrets = json.load(open(path("secrets.json")))
     child = {k: secrets[v[len("pass://"):]] if v.startswith("pass://") else v for k, v in env.items()}
     os.execve(args[2], args[2:], child)
@@ -52,23 +53,23 @@ if not name:
 finish(open(path(name)).read())
 '''
 
+# Runs inside the sandbox, which has no host path to write to. With a network it sends what it saw to the
+# test's listener and exits 9. Without one it exits 7 if what it saw equals the test's expectation, else 8.
 CHILD = r'''
-import errno, json, os, socket, sys
+import json, os, socket, sys
+port, want, *host = sys.argv[1:]
 raw = open("/proc/self/environ", "rb").read().split(b"\0")
 env = dict(entry.decode().split("=", 1) for entry in raw if entry)
-net = "skipped"
-if len(sys.argv) > 2:
-    try:
-        with socket.create_connection(("127.0.0.1", int(sys.argv[2])), timeout=5) as s:
-            s.sendall(env.get("PW", "").encode())
-        net = "connected"
-    except OSError as e:
-        net = errno.errorcode.get(e.errno, repr(e))
-json.dump({"env": env, "cwd": os.getcwd(), "mode": oct(os.stat(".").st_mode & 0o777), "net": net},
-          open(sys.argv[1], "w"))
+seen = {"env": env, "cwd": os.getcwd(), "tmp": os.listdir("/tmp"), "host": [p for p in host if os.path.exists(p)]}
 print(env.get("PW"))
-sys.exit(7)
+try:
+    with socket.create_connection(("127.0.0.1", int(port)), timeout=5) as s:
+        s.sendall(json.dumps(seen).encode())
+except OSError:
+    sys.exit(7 if seen == json.loads(want) else 8)
+sys.exit(9)
 '''
+PYTHON = "/usr/bin/python3"
 
 
 def item(urls):
@@ -134,17 +135,17 @@ def error(c, name, **args):
     raise AssertionError(f"{name} succeeded: {got}")
 
 
-def child(d, port=None):
-    write(d, "child.py", CHILD)
-    out = os.path.join(d, "child.json")
-    return [sys.executable, os.path.join(d, "child.py"), out] + ([str(port)] if port else []), out
+def child(d, port=1):
+    want = {"env": {"PATH": "/usr/bin:/bin", "HOME": "/tmp", "PWD": "/tmp", "PW": PIN}, "cwd": "/tmp", "tmp": [], "host": []}
+    host = [d, session(d), os.path.join(d, "pat"), ROOT, os.path.expanduser("~")]
+    return [PYTHON, "-c", CHILD, str(port), json.dumps(want), *host], want
 
 
 class Operator:
     """The human at the approval socket, played by the test as the same uid."""
 
-    def __init__(self, d, reply=None):
-        self.prompts, self.reply = [], reply or {"op": "allow"}
+    def __init__(self, d, reply=None, gate=None):
+        self.prompts, self.reply, self.gate = [], reply or {"op": "allow"}, gate
         self.path = os.path.join(session(d), "approve.sock")
         self.sock = socket.socket(socket.AF_UNIX)
         self.sock.bind(self.path)
@@ -159,6 +160,8 @@ class Operator:
                 return
             with conn:
                 self.prompts.append(json.loads(conn.makefile("rb").readline()))
+                if self.gate:
+                    self.gate.wait(30)
                 conn.sendall(json.dumps(self.reply).encode() + b"\n")
 
     def close(self):

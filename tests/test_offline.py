@@ -1,11 +1,19 @@
-import fcntl, json, os, select, socket, stat, subprocess, sys, tempfile, termios
-from harness import (HOST_SECRET, PASSWORD, PIN, SEED, SERVER, TOKEN, Operator, calls, child, error, install,
-                     server_env, session, start, write)
+import fcntl, json, os, select, shutil, socket, stat, subprocess, sys, termios
+from harness import (PASSWORD, PIN, SEED, SERVER, TOKEN, Operator, calls, child, error, install, server_env,
+                     session, start, write)
 
-ISOLATE = ["/usr/bin/unshare", "--user", "--net", "--map-root-user", "--"]
-STRIP = ["/usr/bin/env", "-u", "PROTON_PASS_SESSION_DIR", "-u", "PROTON_PASS_AGENT_REASON",
-         "-u", "PROTON_PASS_PERSONAL_ACCESS_TOKEN", "-u", "PASS_PAT_FILE", "-u", "PASS_CLI", "--"]
+BWRAP = shutil.which("bwrap")
+SANDBOX = ["--unshare-user", "--unshare-net", "--die-with-parent",
+           "--unsetenv", "PROTON_PASS_SESSION_DIR", "--unsetenv", "PROTON_PASS_AGENT_REASON",
+           "--unsetenv", "PROTON_PASS_PERSONAL_ACCESS_TOKEN", "--unsetenv", "PASS_PAT_FILE", "--unsetenv", "PASS_CLI",
+           "--unsetenv", "HOME", "--setenv", "HOME", "/tmp", "--setenv", "PATH", "/usr/bin:/bin",
+           "--ro-bind-try", "/usr", "/usr", "--ro-bind-try", "/bin", "/bin", "--ro-bind-try", "/lib", "/lib",
+           "--ro-bind-try", "/lib64", "/lib64", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--chdir", "/tmp",
+           "--"]
+NET_SANDBOX = [a for a in SANDBOX if a != "--unshare-net"]
 REF = "pass://share1/item1/pin"
+FORBIDDEN = {"get_secret", "run_with_secrets", "command", "url_match", "url", "username_selector",
+             "password_selector", "cdp_port", "cwd", "value", "password", "totp_uri"}
 
 
 def runs(d):
@@ -30,6 +38,22 @@ def test_get_secret_and_run_with_secrets_are_unknown_tools():
         names = [t["name"] for t in c.rpc("tools/list")["tools"]]
         assert names == ["list_vaults", "search_items", "describe_item", "get_totp", "fill_login", "run_approved"], names
         assert calls(d) == [], calls(d)
+    finally:
+        c.close()
+
+
+def test_no_tool_takes_a_forbidden_parameter():
+    d, c = start()
+    try:
+        tools = c.rpc("tools/list")["tools"]
+        props = {t["name"]: sorted(t["inputSchema"]["properties"]) for t in tools}
+        assert props == {
+            "list_vaults": [], "search_items": ["limit", "query", "type", "vault"],
+            "describe_item": ["item_id", "reason", "share_id"], "get_totp": ["item_id", "reason", "share_id"],
+            "fill_login": ["item_id", "reason", "share_id", "submit"], "run_approved": ["argv", "env", "reason"],
+        }, props
+        assert (hit := FORBIDDEN & {n for t in tools for n in (t["name"], *t["inputSchema"]["properties"])}) == set(), hit
+        assert all(t["inputSchema"]["additionalProperties"] is False for t in tools), tools
     finally:
         c.close()
 
@@ -61,25 +85,23 @@ def test_run_child_has_no_network_and_no_host_secrets_under_approve():
     listener = socket.create_server(("127.0.0.1", 0))
     listener.settimeout(0.5)
     try:
-        argv, out = child(d, listener.getsockname()[1])
+        argv, _ = child(d, listener.getsockname()[1])
         got = c.call("run_approved", argv=argv, env={"PW": REF}, reason="deploy")
         assert got == {"exit_code": 7}, got
-        assert op.prompts == [{"action": "run", "argv": argv, "env": [["PW", REF, "Bank"]], "reason": "deploy"}], op.prompts
-        assert runs(d) == [["run", "--", *ISOLATE, *STRIP, *argv]], runs(d)
+        assert PIN not in json.dumps(got), got
+        assert op.prompts == [{"action": "run", "argv": argv, "env": [["PW", REF, "Bank", "pin"]],
+                               "reason": "deploy"}], op.prompts
+        assert runs(d) == [["run", "--", BWRAP, *SANDBOX, *argv]], runs(d)
         cli_env = json.load(open(os.path.join(d, "run-env.json")))
         assert cli_env == {"PATH": os.environ["PATH"], "PROTON_PASS_SESSION_DIR": session(d),
-                           "PROTON_PASS_AGENT_REASON": "deploy", "PW": REF}, cli_env
-        seen = json.load(open(out))
-        assert seen["env"] == {"PATH": os.environ["PATH"], "PW": PIN}, seen["env"]
-        assert seen["net"] == "ENETUNREACH", seen["net"]
+                           "PROTON_PASS_AGENT_REASON": "proton-pass plugin", "PW": REF}, cli_env
+        assert (fds := json.load(open(os.path.join(d, "run-fds.json")))) == ["/dev/null"] * 3, fds
         try:
             listener.accept()
             raise AssertionError("the child reached the listener without approve-net")
         except TimeoutError:
             pass
-        assert os.path.dirname(seen["cwd"]) == session(d) and os.path.basename(seen["cwd"]).startswith("run-"), seen
-        assert seen["mode"] == "0o700", seen["mode"]
-        assert not os.path.exists(seen["cwd"]), seen["cwd"]
+        assert (left := os.listdir(session(d))) == ["approve.sock"], left
     finally:
         listener.close()
         op.close()
@@ -92,13 +114,12 @@ def test_run_child_reaches_the_network_only_under_approve_net():
     listener = socket.create_server(("127.0.0.1", 0))
     listener.settimeout(5)
     try:
-        argv, out = child(d, listener.getsockname()[1])
-        assert (got := c.call("run_approved", argv=argv, env={"PW": REF}, reason="deploy")) == {"exit_code": 7}, got
-        assert runs(d) == [["run", "--", *STRIP, *argv]], runs(d)
-        assert json.load(open(out))["net"] == "connected"
+        argv, want = child(d, listener.getsockname()[1])
+        assert (got := c.call("run_approved", argv=argv, env={"PW": REF}, reason="deploy")) == {"exit_code": 9}, got
+        assert runs(d) == [["run", "--", BWRAP, *NET_SANDBOX, *argv]], runs(d)
         conn, _ = listener.accept()
-        assert conn.recv(16) == PIN.encode()
-        conn.close()
+        with conn:
+            assert (seen := json.loads(conn.makefile().read())) == want, seen
     finally:
         listener.close()
         op.close()
@@ -111,7 +132,7 @@ def test_run_executes_a_shell_only_when_the_operator_approved_that_argv():
     try:
         assert (got := c.call("run_approved", argv=["/bin/sh", "-c", "exit 3"], env={"PW": REF}, reason="r")) == {"exit_code": 3}, got
         assert op.prompts[0]["argv"] == ["/bin/sh", "-c", "exit 3"], op.prompts
-        assert runs(d) == [["run", "--", *ISOLATE, *STRIP, "/bin/sh", "-c", "exit 3"]], runs(d)
+        assert runs(d) == [["run", "--", BWRAP, *SANDBOX, "/bin/sh", "-c", "exit 3"]], runs(d)
     finally:
         op.close()
         c.close()
@@ -120,19 +141,31 @@ def test_run_executes_a_shell_only_when_the_operator_approved_that_argv():
 def test_run_fails_closed_and_ignores_an_argv_in_the_reply():
     d, c = start()
     try:
-        argv, out = child(d)
-        assert (got := error(c, "run_approved", argv=argv, env={"PW": REF}, reason="r")) == "approval helper is not running", got
+        argv, _ = child(d)
+        assert (got := error(c, "run_approved", argv=argv, env={"PW": REF}, reason="r")) == "approval unavailable", got
         op = Operator(d, {"op": "deny"})
         assert (got := error(c, "run_approved", argv=argv, env={"PW": REF}, reason="r")) == "release denied", got
         op.close()
-        assert runs(d) == [] and not os.path.exists(out), runs(d)
+        assert runs(d) == [], runs(d)
         pwned = os.path.join(d, "pwned")
         op = Operator(d, {"op": "allow", "argv": ["/bin/sh", "-c", f"touch {pwned}"]})
         assert (got := c.call("run_approved", argv=argv, env={"PW": REF}, reason="r")) == {"exit_code": 7}, got
         op.close()
-        assert runs(d) == [["run", "--", *ISOLATE, *STRIP, *argv]], runs(d)
+        assert runs(d) == [["run", "--", BWRAP, *SANDBOX, *argv]], runs(d)
         assert not os.path.exists(pwned)
     finally:
+        c.close()
+
+
+def test_run_without_bwrap_does_not_ask_or_run():
+    d, c = start(PATH="/nonexistent")
+    op = Operator(d)
+    try:
+        argv, _ = child(d)
+        assert (got := error(c, "run_approved", argv=argv, env={"PW": REF}, reason="r")) == "bwrap is not installed", got
+        assert (op.prompts, runs(d)) == ([], []), (op.prompts, runs(d))
+    finally:
+        op.close()
         c.close()
 
 
@@ -148,6 +181,9 @@ def test_run_rejects_relative_argv_reserved_names_and_literal_values():
             ({"argv": ["/bin/true"], "env": {"PW": "literal-secret-value"}},
              "env PW must be a pass://SHARE_ID/ITEM_ID/FIELD reference"),
             ({"argv": ["/bin/true"], "env": {"BAD-NAME": REF}}, "invalid env name BAD-NAME"),
+            *(({"argv": ["/bin/true"], "env": {"PW": ref}}, "env PW must be a pass://SHARE_ID/ITEM_ID/FIELD reference")
+              for ref in ("pass://share1/item1/password?totp=uri", "pass://share1/item1/pin#x",
+                          "pass://share1/item1/pin/extra", "pass://share1//pin", "pass://share1/item1/-pin")),
         )
         for args, want in cases:
             got = error(c, "run_approved", reason="r", **args)
@@ -163,6 +199,24 @@ def test_describe_item_drops_url_userinfo():
     try:
         got = c.call("describe_item", share_id="share1", item_id="item1", reason="r")
         assert got["urls"] == ["https://bank.example/login", "https://bank.com/login"], got["urls"]
+    finally:
+        c.close()
+
+
+def test_describe_item_returns_no_note_card_number_or_private_key():
+    note, card, key = "NOTE-CANARY", "4111111111111111", "-----BEGIN OPENSSH PRIVATE KEY-----KEY-CANARY"
+    d, c = start()
+    try:
+        for kind, content in (("CreditCard", {"cardholder_name": "Ada", "number": card, "verification_number": "123"}),
+                              ("SshKey", {"private_key": key, "public_key": "ssh-ed25519 AAAA"})):
+            write(d, "item.json", {"item": {"id": "item1", "share_id": "share1", "content": {
+                "title": "Bank", "note": note, "content": {kind: content},
+                "extra_fields": [{"name": "backup", "content": {"Hidden": key}}]}}})
+            got = c.call("describe_item", share_id="share1", item_id="item1", reason="r")
+            assert got == {"title": "Bank", "share_id": "share1", "item_id": "item1", "type": kind, "urls": [],
+                           "username": "", "email": "", "has_password": False, "has_totp": False,
+                           "extra_field_names": ["backup"], "has_note": True}, got
+            assert [s for s in (note, card, key) if s in json.dumps(got)] == [], got
     finally:
         c.close()
 
@@ -187,7 +241,7 @@ def test_get_totp_returns_only_the_digits_after_approval():
         assert op.prompts == [{"action": "totp", "title": "Bank", "reason": "2fa"}], op.prompts
         op.close()
         before = len(calls(d))
-        assert (got := error(c, "get_totp", share_id="share1", item_id="item1", reason="2fa")) == "approval helper is not running", got
+        assert (got := error(c, "get_totp", share_id="share1", item_id="item1", reason="2fa")) == "approval unavailable", got
         assert [a for a in calls(d)[before:] if a[:2] == ["item", "totp"]] == [], calls(d)
         op = Operator(d, {"op": "allow-net"})
         assert (got := error(c, "get_totp", share_id="share1", item_id="item1", reason="2fa")) == "release denied", got
@@ -221,13 +275,21 @@ def test_symlink_pat_is_refused_and_login_is_not_run():
         c.close()
 
 
-def test_pat_must_be_mode_0600():
-    for mode in (0o644, 0o400):
+def test_pat_must_be_private_to_its_owner():
+    for mode in (0o644, 0o640, 0o602):
         d, c = start()
         try:
             os.chmod(os.path.join(d, "pat"), mode)
-            assert (got := error(c, "list_vaults")) == "PAT file must be mode 0600", got
+            assert (got := error(c, "list_vaults")) == "PAT file must not be accessible to group or others", (mode, got)
             assert logins(d) == [], calls(d)
+        finally:
+            c.close()
+    for mode in (0o400, 0o600):
+        d, c = start()
+        try:
+            os.chmod(os.path.join(d, "pat"), mode)
+            assert c.call("list_vaults")[0]["name"] == "V"
+            assert len(logins(d)) == 1, calls(d)
         finally:
             c.close()
 
@@ -247,30 +309,17 @@ def test_symlink_dot_session_refuses_to_start():
     assert (got := startup(d)) == (1, "proton-pass: PROTON_PASS_SESSION_DIR/.session must not be a symlink\n"), got
 
 
-def test_open_session_dir_we_own_becomes_0700():
+def test_open_session_dir_we_own_becomes_0700_and_a_second_start_adopts_it():
     d = install()
     os.mkdir(session(d))
     os.chmod(session(d), 0o777)
-    d, c = start(d)
-    try:
-        c.call("list_vaults")
-        assert stat.S_IMODE(os.stat(session(d)).st_mode) == 0o700
-    finally:
-        c.close()
-
-
-def test_startup_removes_leftover_run_dirs_without_following_symlinks():
-    d = install()
-    os.makedirs(os.path.join(session(d), "run-old", "nested"))
-    os.mkdir(os.path.join(d, "outside"))
-    write(d, "outside/keep", "keep")
-    os.symlink(os.path.join(d, "outside"), os.path.join(session(d), "run-link"))
-    d, c = start(d)
-    try:
-        assert sorted(os.listdir(session(d))) == ["run-link"], os.listdir(session(d))
-        assert open(os.path.join(d, "outside", "keep")).read() == "keep"
-    finally:
-        c.close()
+    for _ in range(2):
+        d, c = start(d)
+        try:
+            assert c.call("list_vaults")[0]["name"] == "V"
+            assert (mode := stat.S_IMODE(os.stat(session(d)).st_mode)) == 0o700, oct(mode)
+        finally:
+            c.close()
 
 
 def test_leading_dash_ids_and_vaults_never_reach_pass_cli():
@@ -324,7 +373,7 @@ def test_approve_helper_shows_the_claim_on_the_tty():
     helper, tty = start_helper(d)
     try:
         read_tty(tty, b"listening")
-        argv, out = child(d)
+        argv, _ = child(d)
         reason = "deploy\x1b[2J\nnow"
         c.send({"jsonrpc": "2.0", "id": 90, "method": "tools/call", "params": {
             "name": "run_approved", "arguments": {"argv": argv, "env": {"PW": REF}, "reason": reason}}})
@@ -336,7 +385,7 @@ def test_approve_helper_shows_the_claim_on_the_tty():
             "  action:  run",
             "  argv:    " + repr(argv[0]),
             *["           " + repr(a) for a in argv[1:]],
-            f"  env:     'PW' = {REF!r} from 'Bank'",
+            f"  env:     'PW' = {REF!r} (field 'pin' of 'Bank')",
             "  network: off (type approve-net to allow it)",
             "  reason:  " + repr(reason),
             "Type approve to release. Anything else denies.",

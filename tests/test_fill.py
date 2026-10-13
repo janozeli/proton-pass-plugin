@@ -1,15 +1,19 @@
-import contextlib, http.server, os, socket, subprocess, tempfile, threading, time, urllib.request
+import contextlib, http.server, json, os, socket, subprocess, tempfile, threading, time, urllib.request
 from types import SimpleNamespace
 from playwright.sync_api import sync_playwright
 from harness import PASSWORD, Operator, error, start, write
 
 PAGES = {
     "login.html": """<form id=search><input id=q name=q></form>
-<form action=done.html><input id=user name=username><input id=pw type=password><button>Go</button></form>
+<form action=done.html><input id=user name=username><input id=hpw type=password hidden><input id=pw type=password>
+<button>Go</button></form>
 <iframe srcdoc="<input id=fpw type=password>"></iframe>""",
     "stuck.html": """<form onsubmit="return false">
 <input id=user name=username><input id=pw type=password><button>Go</button></form>""",
     "done.html": "<p>done</p>",
+    "kept.html": "<input id=pw type=password value=leftover>",
+    "patched.html": """<script>Array.prototype.includes = () => true; Array.prototype.indexOf = () => 0;</script>
+<form><input id=user name=username><input id=pw type=password><button>Go</button></form>""",
 }
 ITEM = {"share_id": "share1", "item_id": "item1", "reason": "log in"}
 
@@ -60,8 +64,8 @@ def tab(lab, path):
         page.close()
 
 
-def server(lab):
-    return start(urls=[f"{lab.good}/login.html"], PASS_CDP_PORT=str(lab.port))
+def server(lab, port=None):
+    return start(urls=[f"{lab.good}/login.html"], PASS_CDP_PORT=str(port or lab.port))
 
 
 def test_fill_skips_a_tab_on_another_origin_and_hides_its_url(lab):
@@ -77,45 +81,110 @@ def test_fill_skips_a_tab_on_another_origin_and_hides_its_url(lab):
         c.close()
 
 
-def test_fill_types_only_into_the_main_frame_password_of_the_item_origin(lab):
+def test_fill_refuses_two_matching_tabs(lab):
+    d, c = server(lab)
+    op = Operator(d)
+    try:
+        with tab(lab, "/login.html") as one, tab(lab, "/stuck.html") as two:
+            got = error(c, "fill_login", **ITEM)
+            assert got == "more than one open tab matches this item's websites (3 tabs open)", got
+            assert op.prompts == [], op.prompts
+            assert [value(one, "#pw"), value(two, "#pw")] == ["", ""]
+    finally:
+        op.close()
+        c.close()
+
+
+def test_fill_types_only_into_the_visible_main_frame_password_of_the_item_origin(lab):
     d, c = server(lab)
     op = Operator(d)
     try:
         with tab(lab, "/login.html") as page:
             got = c.call("fill_login", **ITEM)
             assert got == {"filled": ["username", "password"], "submitted": False}, got
-            assert op.prompts == [{"action": "fill", "title": "Bank", "origins": [lab.good],
+            assert op.prompts == [{"action": "fill", "title": "Bank", "origin": lab.good,
                                    "submit": False, "reason": "log in"}], op.prompts
-            fields = [value(page, "#user"), value(page, "#pw"), value(page, "#q"), frame_value(page)]
-            assert fields == ["ada", PASSWORD, "", ""], fields
+            fields = [value(page, s) for s in ("#user", "#pw", "#hpw", "#q")] + [frame_value(page)]
+            assert fields == ["ada", PASSWORD, "", "", ""], fields
             assert value(lab.phish, "#pw") == ""
     finally:
         op.close()
         c.close()
 
 
-def test_fill_submit_clears_a_password_the_page_kept(lab):
+def test_fill_submit_presses_enter_and_clears_the_password_only_off_origin(lab):
     d, c = server(lab)
     op = Operator(d)
     try:
         with tab(lab, "/stuck.html") as page:
             got = c.call("fill_login", submit=True, **ITEM)
-            assert got == {"filled": ["username", "password"], "submitted": False}, got
-            assert [value(page, "#user"), value(page, "#pw")] == ["ada", ""]
+            assert got == {"filled": ["username", "password"], "submitted": True}, got
+            assert [value(page, "#user"), value(page, "#pw")] == ["ada", PASSWORD]
         with tab(lab, "/login.html") as page:
             got = c.call("fill_login", submit=True, **ITEM)
             assert got == {"filled": ["username", "password"], "submitted": True}, got
-            assert page.url == f"{lab.good}/done.html?username=ada", page.url
+            page.wait_for_url(f"{lab.good}/done.html?username=ada", timeout=5000)
+        with tab(lab, "/away.html") as page:
+            got = c.call("fill_login", submit=True, **ITEM)
+            assert got == {"filled": ["username", "password"], "submitted": True}, got
+            page.wait_for_url(f"{lab.bad}/kept.html?username=ada", timeout=5000)
+            assert value(page, "#pw") == ""
     finally:
         op.close()
         c.close()
+
+
+def test_fill_rechecks_the_origin_after_approval(lab):
+    d, c = server(lab)
+    gate = threading.Event()
+    op = Operator(d, gate=gate)
+    try:
+        with tab(lab, "/login.html") as page:
+            c.send({"jsonrpc": "2.0", "id": 70, "method": "tools/call",
+                    "params": {"name": "fill_login", "arguments": ITEM}})
+            for _ in range(200):
+                if op.prompts:
+                    break
+                time.sleep(0.05)
+            page.goto(f"{lab.bad}/patched.html")
+            gate.set()
+            got = c.read()["result"]
+            assert got == {"content": [{"type": "text", "text": "no open tab matches this item's websites (2 tabs open)"}],
+                           "isError": True}, got
+            assert [value(page, "#user"), value(page, "#pw")] == ["", ""]
+    finally:
+        op.close()
+        c.close()
+
+
+def test_fill_refuses_a_cdp_endpoint_off_loopback(lab):
+    class Version(Quiet):
+        def do_GET(self):
+            body = json.dumps({"webSocketDebuggerUrl": f"ws://evil.example:{lab.port}/devtools/browser/x"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Version)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    d, c = server(lab, srv.server_address[1])
+    op = Operator(d)
+    try:
+        assert (got := error(c, "fill_login", **ITEM)) == "the browser's CDP address is not 127.0.0.1", got
+        assert op.prompts == [], op.prompts
+    finally:
+        op.close()
+        c.close()
+        srv.shutdown()
 
 
 def test_fill_fails_closed_without_an_allow(lab):
     d, c = server(lab)
     try:
         with tab(lab, "/login.html") as page:
-            assert (got := error(c, "fill_login", **ITEM)) == "approval helper is not running", got
+            assert (got := error(c, "fill_login", **ITEM)) == "approval unavailable", got
             for reply in ({"op": "deny"}, {"op": "allow-net"}):
                 op = Operator(d, reply)
                 assert (got := error(c, "fill_login", **ITEM)) == "release denied", got
@@ -130,6 +199,8 @@ if __name__ == "__main__":
     for name, html in PAGES.items():
         write(root, name, html)
     good, bad = serve(root), serve(root)
+    write(root, "away.html", f"""<form action="{bad}/kept.html">
+<input id=user name=username><input id=pw type=password><button>Go</button></form>""")
     failed = 0
     with sync_playwright() as pw:
         chrome, port = launch(pw, f"{bad}/login.html")
@@ -137,7 +208,7 @@ if __name__ == "__main__":
             ctx = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}").contexts[0]
             phish = ctx.pages[0]
             phish.wait_for_load_state()
-            lab = SimpleNamespace(ctx=ctx, phish=phish, good=good, port=port)
+            lab = SimpleNamespace(ctx=ctx, phish=phish, good=good, bad=bad, port=port)
             tests = [f for name, f in list(globals().items()) if name.startswith("test_")]
             for test in tests:
                 try:
