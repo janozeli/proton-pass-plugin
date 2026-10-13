@@ -14,16 +14,8 @@ SANDBOX = ["--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-net", 
            "--chdir", "/tmp", "--"]
 NET_SANDBOX = [a for a in SANDBOX if a != "--unshare-net"]
 REF = "pass://share1/item1/pin"
-RENAME = (
-    "import json,os,sys\n"
-    "keep={'PATH','HOME','PWD'}\n"
-    "for src,dst in json.loads(sys.argv[1]):\n"
-    " os.environ[dst]=os.environ.pop(src)\n"
-    " keep.add(dst)\n"
-    "for name in list(os.environ):\n"
-    " if name not in keep: del os.environ[name]\n"
-    "os.execv(sys.argv[2],sys.argv[2:])\n"
-)
+sys.path.insert(0, os.path.dirname(SERVER))
+from proton_pass_mcp import RENAME
 
 
 def launch(argv, names):
@@ -252,6 +244,28 @@ def test_run_cannot_publish_credentials_in_an_inherited_keyring():
     result = subprocess.run([sys.executable, "-c", "from test_offline import _check_inherited_keyring; _check_inherited_keyring()"],
                             cwd=os.path.dirname(__file__), capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stderr
+
+
+def test_run_trampoline_refuses_to_exec_when_seccomp_setup_fails():
+    from unittest.mock import Mock, patch
+    for failure in ("library", "seccomp_init", "seccomp_syscall_resolve_name", "seccomp_rule_add", "seccomp_load"):
+        library = Mock()
+        library.seccomp_init.return_value = 1
+        library.seccomp_syscall_resolve_name.return_value = 1
+        library.seccomp_rule_add.return_value = 0
+        library.seccomp_load.return_value = 0
+        if failure != "library":
+            getattr(library, failure).return_value = 0 if failure == "seccomp_init" else -1
+        with patch("ctypes.CDLL", return_value=library) as load, patch("os.execv") as execute:
+            if failure == "library":
+                load.side_effect = OSError("library unavailable")
+            try:
+                exec(RENAME, {})
+            except (OSError, RuntimeError):
+                pass
+            else:
+                raise AssertionError(f"{failure} did not fail closed")
+            execute.assert_not_called()
 
 
 def test_run_executes_a_shell_only_when_the_operator_approved_that_argv():

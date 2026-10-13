@@ -29,7 +29,27 @@ RUN_TIMEOUT = 300
 REASON_LIMIT = 300
 ARGV_LIMIT = 1024
 RENAME = (
-    "import json,os,sys\n"
+    "import ctypes,errno,json,os,sys\n"
+    # Namespaces do not isolate inherited kernel keyrings. Install the filter
+    # in this trusted trampoline before renaming secrets or executing user code.
+    # libseccomp resolves native syscall numbers and rejects other ABIs by default.
+    "sc=ctypes.CDLL('libseccomp.so.2')\n"
+    "sc.seccomp_init.argtypes=[ctypes.c_uint32]\n"
+    "sc.seccomp_init.restype=ctypes.c_void_p\n"
+    "sc.seccomp_syscall_resolve_name.argtypes=[ctypes.c_char_p]\n"
+    "sc.seccomp_rule_add.argtypes=[ctypes.c_void_p,ctypes.c_uint32,ctypes.c_int,ctypes.c_uint]\n"
+    "sc.seccomp_load.argtypes=[ctypes.c_void_p]\n"
+    "sc.seccomp_release.argtypes=[ctypes.c_void_p]\n"
+    "sc.seccomp_release.restype=None\n"
+    "ctx=sc.seccomp_init(0x7fff0000) # SCMP_ACT_ALLOW\n"
+    "if not ctx: raise RuntimeError('seccomp initialization failed')\n"
+    "try:\n"
+    " for name in (b'add_key',b'request_key',b'keyctl'):\n"
+    "  nr=sc.seccomp_syscall_resolve_name(name)\n"
+    "  if nr<0 or sc.seccomp_rule_add(ctx,0x00050000|errno.EPERM,nr,0)!=0:\n"
+    "   raise RuntimeError('seccomp rule failed')\n"
+    " if sc.seccomp_load(ctx)!=0: raise RuntimeError('seccomp load failed')\n"
+    "finally: sc.seccomp_release(ctx)\n"
     "keep={'PATH','HOME','PWD'}\n"
     "for src,dst in json.loads(sys.argv[1]):\n"
     " os.environ[dst]=os.environ.pop(src)\n"
