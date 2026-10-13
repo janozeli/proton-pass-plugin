@@ -46,7 +46,7 @@ proton-pass release request
 Type approve to release. Anything else denies.
 ```
 
-Every string on the prompt, including item titles from your vault, is printed with Python `repr`, so an escape sequence shows up as text and cannot redraw your terminal. Type `approve` to release the request. For a `run_approved` request, type `approve-net` to release it with network access. Any other line denies it. A request that gets no answer within 180 seconds is denied.
+Every string on the prompt, including item titles from your vault, is printed with Python `repr`, so an escape sequence shows up as text and cannot redraw your terminal. Type `approve` to release the request. For a `run_approved` request, type `approve-net` to release it with network access. Any other line denies it. A request that gets no answer within 180 seconds is denied. The helper monitors both the terminal and the client connection, discards disconnected requests, and proceeds to the next request even if no complete answer was typed.
 
 If the helper is not running, `fill_login`, `get_totp`, and `run_approved` fail with `approval unavailable`. The metadata tools keep working.
 
@@ -91,7 +91,7 @@ The session directory must be a real directory that you own. The server sets it 
 ## What this does not stop
 
 - Another process running as your user can bind the approval socket before the helper does, and it can read the token file from outside the sandbox. Such a process does not need this server to reach your vault.
-- A release that is waiting for you does not notice when the agent cancels the request.
+- Agent cancellation over MCP is not implemented; closing the approval connection or reaching its deadline cancels the terminal request.
 - The exit code is one byte that the model sees.
 - With `approve-net`, an approved program can send its secrets to any network it can reach.
 - `fill_login` without `submit` leaves the password in the page, where anything that can read the page can read it.

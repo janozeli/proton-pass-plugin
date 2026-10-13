@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import ipaddress, http.client, json, os, re, shutil, signal, socket, stat, struct, subprocess, sys, termios, unicodedata
+import ipaddress, http.client, json, os, re, shutil, signal, select, socket, stat, struct, subprocess, sys, termios, time, unicodedata
 from urllib.parse import urlsplit
 import idna
 
@@ -214,6 +214,41 @@ def render(p):
     return "\n".join(lines)
 
 
+def read_approval_prompt(conn, deadline):
+    data = bytearray()
+    while len(data) < 65536:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([conn], [], [], remaining)[0]:
+            raise ValueError("request expired")
+        chunk = conn.recv(65536 - len(data))
+        if not chunk:
+            raise ValueError("request disconnected")
+        data.extend(chunk)
+        if b"\n" in data:
+            return json.loads(data)
+    raise ValueError("request too large")
+
+
+def read_approval_answer(conn, tty_in, deadline):
+    answer = bytearray()
+    while len(answer) < 4096:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        ready, _, _ = select.select([conn, tty_in], [], [], remaining)
+        # The request protocol has no further client messages. Readability here
+        # means disconnection or unexpected data; either invalidates approval.
+        if not ready or conn in ready or time.monotonic() >= deadline:
+            return None
+        chunk = os.read(tty_in.fileno(), 4096 - len(answer))
+        if not chunk:
+            return None
+        answer.extend(chunk)
+        if b"\n" in answer:
+            return answer.decode("utf-8", errors="replace").strip()
+    return None
+
+
 def serve_approvals():
     path = os.path.join(SESSION, "approve.sock")
     if os.path.islink(path):
@@ -239,12 +274,17 @@ def serve_approvals():
             try:
                 if peer_uid(conn) != os.getuid():
                     continue
+                deadline = time.monotonic() + APPROVAL_TIMEOUT
                 conn.settimeout(10)
-                prompt = json.loads(conn.makefile("rb").readline(65536))
+                prompt = read_approval_prompt(conn, min(deadline, time.monotonic() + 10))
+                if time.monotonic() >= deadline or select.select([conn], [], [], 0)[0]:
+                    continue
                 text = render(prompt)
                 termios.tcflush(tty_in, termios.TCIFLUSH)
                 print(text, file=tty, flush=True)
-                line = tty_in.readline().strip()
+                line = read_approval_answer(conn, tty_in, deadline)
+                if line is None:
+                    print("Request expired or disconnected; denied.", file=tty, flush=True)
                 op = "allow-net" if line == "approve-net" and prompt["action"] == "run" else "allow" if line == "approve" else "deny"
                 conn.sendall(json.dumps({"op": op}).encode() + b"\n")
             except (OSError, ValueError, KeyError, TypeError):
