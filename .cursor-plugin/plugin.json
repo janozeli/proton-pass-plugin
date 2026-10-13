@@ -1,0 +1,14 @@
+{
+  "name": "proton-pass",
+  "displayName": "Proton Pass",
+  "version": "0.1.0",
+  "description": "Use Proton Pass from the agent via the official pass-cli: list vaults, search items, TOTP, fill logins into a browser via CDP and run commands with secrets, without the model seeing secret values.",
+  "author": { "name": "Lucas Janozeli" },
+  "license": "MIT",
+  "logo": "assets/logo.svg",
+  "keywords": ["proton", "proton pass", "password manager", "secrets", "totp", "mcp"],
+  "category": "integrations",
+  "tags": ["passwords", "secrets", "mcp"],
+  "mcpServers": "./mcp.json",
+  "skills": "./skills/"
+}
