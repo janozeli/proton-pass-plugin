@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-import http.client, json, os, re, shutil, signal, socket, stat, struct, subprocess, sys, termios, unicodedata
+import ipaddress, http.client, json, os, re, shutil, signal, socket, stat, struct, subprocess, sys, termios, unicodedata
 from urllib.parse import urlsplit
+import idna
 
 PASS_CLI = os.path.expanduser(os.environ.get("PASS_CLI", "~/.local/bin/pass-cli"))
 PAT_FILE = os.path.expanduser(os.environ.get("PASS_PAT_FILE", "~/.config/pass-agent/pat"))
@@ -131,19 +132,31 @@ def login_content(item):
     return c.get("Login") if isinstance(c, dict) else None
 
 
-def _host(u):
-    return f"[{u.hostname}]" if ":" in u.hostname else u.hostname
-
-
 def browser_origin(url):
+    # Accept a conservative subset of browser URLs. Never let urlsplit silently
+    # strip controls or interpret a backslash differently from a browser.
+    if not isinstance(url, str) or any(ord(c) <= 32 or c == "\\" for c in url):
+        return None
     try:
         u = urlsplit(url if "://" in url else "https://" + url)
+        default = {"https": 443, "http": 80}.get(u.scheme)
+        if not default or not u.hostname:
+            return None
         port = u.port
-        host = _host(u).encode("idna").decode() if u.hostname else None
-    except ValueError:
-        return None
-    default = {"https": 443, "http": 80}.get(u.scheme)
-    if not default or not host:
+        authority = u.netloc.rsplit("@", 1)[-1]
+        if ":" in u.hostname:
+            if not re.fullmatch(r"\[[0-9a-fA-F:.]+\](?::[0-9]*)?", authority):
+                return None
+            host = f"[{ipaddress.IPv6Address(u.hostname)}]"
+        else:
+            host = idna.encode(u.hostname, uts46=True, transitional=False).decode("ascii")
+            # WHATWG also accepts legacy IPv4 spellings; reject those rather
+            # than treating a numeric host as an ordinary DNS name.
+            last = host.rstrip(".").rsplit(".", 1)[-1]
+            if last.isdigit() or re.fullmatch(r"0x[0-9a-f]*", last):
+                if str(ipaddress.IPv4Address(host)) != host:
+                    return None
+    except (ValueError, idna.IDNAError):
         return None
     return f"{u.scheme}://{host}" + (f":{port}" if port not in (None, default) else "")
 
