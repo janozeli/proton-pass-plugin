@@ -356,7 +356,8 @@ FILL = """function(arg) {
   if (location.origin !== arg.origin) return null;
   const eligible = el => {
     const box = el.getBoundingClientRect();
-    return el.isConnected && !el.disabled && !el.readOnly && box.width > 0 && box.height > 0 &&
+    return el.isConnected && !el.matches(':disabled') && !el.closest('[inert]') &&
+      !el.readOnly && box.width > 0 && box.height > 0 &&
       el.checkVisibility({visibilityProperty: true, opacityProperty: true});
   };
   const inputs = () => [...document.querySelectorAll("input")].filter(eligible);
