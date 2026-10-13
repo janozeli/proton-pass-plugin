@@ -261,11 +261,17 @@ def test_fill_checks_deep_focus_in_nested_shadow_roots(lab):
 
 def test_fill_refuses_credentials_when_focus_is_redirected(lab):
     for field in ("user", "pw"):
-        with tab(lab, "/login.html") as page:
-            page.set_content('<button id=sink>Elsewhere</button><form><input id=user><input id=pw type=password></form>')
-            page.eval_on_selector('#' + field, "el => el.onfocus = () => sink.focus()")
-            isolated_fill(page, {"origin": lab.good, "username": "ada", "password": PASSWORD})
-            assert value(page, '#' + field) == "", field
+        # Refuse both at discovery and immediately before the actual write,
+        # after earlier focus probes have succeeded.
+        for redirect_at in (1, 2 if field == "user" else 3):
+            with tab(lab, "/login.html") as page:
+                page.set_content('<button id=sink>Elsewhere</button><form><input id=user><input id=pw type=password></form>')
+                page.eval_on_selector('#' + field, """(el, redirectAt) => {
+                  let count = 0;
+                  el.onfocus = () => { if (++count >= redirectAt) sink.focus(); };
+                }""", redirect_at)
+                isolated_fill(page, {"origin": lab.good, "username": "ada", "password": PASSWORD})
+                assert value(page, '#' + field) == "", (field, redirect_at)
 
 
 def test_fill_accepts_modal_dialog_inside_inert_ancestor(lab):

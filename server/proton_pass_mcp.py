@@ -352,55 +352,76 @@ def get_totp(a):
     return {"code": code}
 
 
-FILL = """function*(arg) {
-  // Each yield refreshes Chromium's top-layer order after page event handlers.
-  let topLayer = yield;
+FILL = """function(arg, ...closedRoots) {
   if (location.origin !== arg.origin) return null;
-  const parent = node => node.assignedSlot || node.parentElement || node.getRootNode().host;
-  const inert = el => {
-    const modal = topLayer.findLast(node => node instanceof HTMLDialogElement && node.matches(':modal'));
-    for (let node = el; node; node = parent(node)) {
-      if (node.hasAttribute('inert')) return true;
-      // Only the topmost modal escapes its ancestors' explicit inertness.
-      if (node === modal) return false;
+  // CDP supplies live closed-root references, not eligibility snapshots.
+  const roots = new Map(closedRoots.map(root => [root.host, root]));
+  const shadow = el => el.shadowRoot || roots.get(el);
+  const active = () => {
+    let el = document.activeElement;
+    while (el) {
+      const next = shadow(el)?.activeElement;
+      if (!next) break;
+      el = next;
     }
-    // With a modal open, everything outside its flat-tree subtree is inert.
-    return !!modal;
+    return el;
   };
   const eligible = el => {
     const box = el.getBoundingClientRect();
-    return el.isConnected && !el.matches(':disabled') && !inert(el) &&
+    return el.isConnected && el.ownerDocument === document && !el.matches(':disabled') &&
       !el.readOnly && box.width > 0 && box.height > 0 &&
       el.checkVisibility({visibilityProperty: true, opacityProperty: true});
   };
-  const inputs = () => [...document.querySelectorAll("input")].filter(eligible);
-  const shown = inputs();
-  let pw = shown.find(el => el.type === "password");
+  const focusable = el => {
+    if (!eligible(el)) return false;
+    // An already active control can retain focus after becoming inert until
+    // rendering. Require a fresh browser focus decision instead of that state.
+    if (active() === el) el.blur();
+    el.focus({preventScroll: true});
+    // Focus/blur handlers are synchronous and may redirect focus or mutate el.
+    return location.origin === arg.origin && eligible(el) && active() === el;
+  };
+  const inputs = () => {
+    const found = [];
+    const walk = root => {
+      for (const el of root.querySelectorAll('*')) {
+        if (el instanceof HTMLInputElement) found.push(el);
+        const nested = shadow(el);
+        if (nested) walk(nested);
+      }
+    };
+    walk(document);
+    return found;
+  };
+  const password = () => inputs().find(el => el.type === 'password' && focusable(el) && el.type === 'password');
+  let pw = password();
   if (!pw) return [];
   const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
-  const set = (el, v) => {
+  const userType = el => ["text", "email", "tel"].includes(el.type);
+  const set = (el, v, valid) => {
+    // No yield, await, CDP round trip, or page callback between this verdict
+    // (including the effects of focus handlers) and the native value setter.
+    if (!focusable(el) || !valid()) return false;
     setter.call(el, v);
     el.dispatchEvent(new Event("input", {bubbles: true}));
     el.dispatchEvent(new Event("change", {bubbles: true}));
+    return true;
   };
-  const before = shown.slice(0, shown.indexOf(pw)).filter(el => el.form === pw.form && ["text", "email", "tel"].includes(el.type));
-  const user = before.find(el => /username|email/.test(el.autocomplete)) || before[before.length - 1];
-  if (user && arg.username) set(user, arg.username);
-  // Username events may synchronously replace, hide, or disable the target.
-  topLayer = yield;
-  if (location.origin !== arg.origin) return null;
-  pw = inputs().find(el => el.type === "password");
+  const shown = inputs();
+  const before = shown.slice(0, shown.indexOf(pw)).filter(el => el.form === pw.form && userType(el));
+  const candidates = [...before.filter(el => /username|email/.test(el.autocomplete)), ...before.reverse()];
+  const user = arg.username ? candidates.find(el => focusable(el) && userType(el) && el.form === pw.form) : null;
+  if (user) set(user, arg.username, () => userType(user) && user.form === pw.form);
+  // Username events may synchronously replace or invalidate the password.
+  pw = password();
   if (!pw) return [];
   const form = pw.form;
-  set(pw, arg.password);
-  pw.focus();
-  // Input, change, and focus handlers can also invalidate the completed fill.
-  topLayer = yield;
-  if (location.origin !== arg.origin) return null;
-  if (!eligible(pw) || pw.type !== "password" || pw.form !== form || pw.value !== arg.password) return [];
+  if (!set(pw, arg.password, () => pw.type === 'password' && pw.form === form)) return [];
+  // Recheck both fields after their events, leaving focus on the password.
+  const userOK = user && focusable(user);
+  if (!focusable(pw) || pw.type !== 'password' || pw.form !== form || pw.value !== arg.password) return [];
   const filled = [];
-  if (user && arg.username && eligible(user) && ["text", "email", "tel"].includes(user.type) &&
-      user.form === form && user.value === arg.username) filled.push("username");
+  if (userOK && eligible(user) && userType(user) && user.form === form && user.value === arg.username) filled.push("username");
   filled.push("password");
   return filled;
 }"""
@@ -478,29 +499,31 @@ def isolated_fill(page, arg):
     try:
         frame = session.send("Page.getFrameTree")["frameTree"]["frame"]["id"]
         world = session.send("Page.createIsolatedWorld", {"frameId": frame, "worldName": "proton-pass"})
-        session.send("DOM.enable")
-        session.send("DOM.getDocument")
-        generator = call({
+        document = session.send("DOM.getDocument", {"depth": -1, "pierce": True})["root"]
+        arguments = [{"value": arg}]
+        pending = [document]
+        while pending:
+            node = pending.pop()
+            pending.extend(node.get("children", []))
+            for root in node.get("shadowRoots", []):
+                if root["shadowRootType"] == "user-agent":
+                    continue
+                pending.append(root)
+                if root["shadowRootType"] == "closed":
+                    obj = session.send("DOM.resolveNode", {
+                        "backendNodeId": root["backendNodeId"],
+                        "executionContextId": world["executionContextId"],
+                        "objectGroup": "proton-pass-fill",
+                    })["object"]
+                    arguments.append({"objectId": obj["objectId"]})
+            # Do not traverse contentDocument: filling is main-frame only.
+        result = call({
             "functionDeclaration": FILL,
             "executionContextId": world["executionContextId"],
-            "arguments": [{"value": arg}],
+            "arguments": arguments,
             "objectGroup": "proton-pass-fill",
+            "returnByValue": True,
         })
-        step = {"objectId": generator["objectId"], "returnByValue": True}
-        result = call({**step, "functionDeclaration": "function() { return this.next(); }"})["value"]
-        while not result["done"]:
-            # :modal is in DOM order; CDP exposes the actual bottom-to-top order,
-            # including backdrops and popovers (which the inert predicate ignores).
-            nodes = session.send("DOM.getTopLayerElements")["nodeIds"]
-            arguments = []
-            for node in nodes:
-                obj = session.send("DOM.resolveNode", {
-                    "nodeId": node, "executionContextId": world["executionContextId"],
-                    "objectGroup": "proton-pass-fill",
-                })["object"]
-                arguments.append({"objectId": obj["objectId"]})
-            result = call({**step, "functionDeclaration": "function(...layer) { return this.next(layer); }",
-                           "arguments": arguments})["value"]
         return result.get("value")
     except (OSError, KeyError, TypeError):
         raise PassError("internal error")
