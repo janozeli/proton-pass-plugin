@@ -173,6 +173,13 @@ def test_fill_skips_inputs_with_a_zero_opacity_ancestor(lab):
 <input id=huser autocomplete=username><input id=hpw type=password></div></div>""")
 
 
+def test_fill_skips_inputs_without_positive_dimensions(lab):
+    for size in ("width:0;height:0", "width:0;height:20px", "width:20px;height:0"):
+        assert_fill_skips_transparent_fields(lab, f"""
+<input id=huser autocomplete=username style="{size};padding:0;border:0">
+<input id=hpw type=password style="{size};padding:0;border:0">""")
+
+
 def test_fill_refuses_automatic_submission_without_filling_or_approval(lab):
     d, c = server(lab)
     op = Operator(d)
