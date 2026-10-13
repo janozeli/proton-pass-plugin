@@ -93,6 +93,27 @@ def test_fill_skips_a_tab_on_another_origin_and_hides_its_url(lab):
         c.close()
 
 
+def test_fill_idna_does_not_authorize_the_transitional_domain(lab):
+    d, c = start(urls=["https://faß.de/login"], PASS_CDP_PORT=str(lab.port))
+    op = Operator(d)
+    page = lab.ctx.new_page()
+    page.route("**/*", lambda route: route.fulfill(body=PAGES["login.html"], content_type="text/html"))
+    try:
+        page.goto("https://fass.de/login")
+        got = error(c, "fill_login", **ITEM)
+        assert got == "no open tab matches this item's websites (2 tabs open)", got
+        assert op.prompts == []
+        assert value(page, "#pw") == ""
+        page.goto("https://xn--fa-hia.de/login")
+        assert c.call("fill_login", **ITEM) == {"filled": ["username", "password"], "submitted": False}
+        assert value(page, "#pw") == PASSWORD
+        assert op.prompts[0]["origin"] == "https://xn--fa-hia.de"
+    finally:
+        page.close()
+        op.close()
+        c.close()
+
+
 def test_fill_refuses_two_matching_tabs(lab):
     d, c = server(lab)
     op = Operator(d)
