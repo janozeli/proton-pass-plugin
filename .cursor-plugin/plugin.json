@@ -1,9 +1,9 @@
 {
   "name": "proton-pass",
   "displayName": "Proton Pass",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "repository": "https://github.com/janozeli/proton-pass-plugin",
-  "description": "Use Proton Pass from the agent via the official pass-cli: list vaults, search items, TOTP, fill logins into a browser via CDP and run commands with secrets, without the model seeing secret values.",
+  "description": "Use Proton Pass from the agent via the official pass-cli: list vaults and search items, and after you approve each release in a terminal, fill a login into a browser tab, get a TOTP code, or run a sandboxed program with secrets in its environment. The model never sees secret values.",
   "author": { "name": "Lucas Janozeli" },
   "license": "MIT",
   "logo": "assets/logo.svg",
