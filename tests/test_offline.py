@@ -522,20 +522,34 @@ def result(msg):
     return text if msg["result"].get("isError") else json.loads(text)
 
 
-def test_approval_prompt_caps_reason_and_argv():
+def test_run_rejects_hidden_argument_tails_before_approval_or_execution():
+    d, c = start()
+    op = Operator(d)
+    try:
+        for arg in (" " * 1024 + "exit 42", "A" * 1025):
+            got = error(c, "run_approved", argv=["/bin/sh", "-c", arg], env={"PW": REF}, reason="r")
+            assert got == "argv arguments must be at most 1024 characters", got
+        assert op.prompts == []
+        assert calls(d) == []
+    finally:
+        op.close()
+        c.close()
+
+
+def test_approval_prompt_caps_reason_but_shows_the_entire_accepted_argv():
     d, c = start()
     helper, tty = start_helper(d)
     try:
         read_tty(tty, b"listening")
         reason = "R" * 400 + "REASON-TAIL"
-        arg = "A" * 1100 + "ARGV-TAIL"
+        arg = "A" * (1024 - len("ARGV-TAIL")) + "ARGV-TAIL"
         c.send({"jsonrpc": "2.0", "id": 92, "method": "tools/call", "params": {
             "name": "run_approved", "arguments": {"argv": ["/bin/true", arg], "env": {"PW": REF}, "reason": reason}}})
         shown = read_tty(tty, b"denies.")
         os.write(tty, b"no\n")
         c.read()
-        assert "REASON-TAIL" not in shown and "ARGV-TAIL" not in shown, shown
-        assert shown.count("truncated") >= 2, shown
+        assert "REASON-TAIL" not in shown and repr(arg) in shown, shown
+        assert shown.count("truncated") == 1, shown
     finally:
         os.close(tty)
         helper.kill()
