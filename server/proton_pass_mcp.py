@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import ipaddress, http.client, json, os, re, shutil, signal, select, socket, stat, struct, subprocess, sys, termios, time, unicodedata
+import ipaddress, http.client, json, os, re, resource, shutil, signal, select, socket, stat, struct, subprocess, sys, termios, time, unicodedata
 from urllib.parse import urlsplit
 import idna
 
@@ -457,10 +457,30 @@ def ref_parts(ref):
     return m.groups() if m and not any(map(bad_token, m.groups())) else None
 
 
+def check_core_policy():
+    # RLIMIT_CORE is ignored for external collectors. Even collectors that
+    # discard the memory image may journal attacker-controlled process metadata.
+    try:
+        with open("/proc/sys/kernel/core_pattern") as f:
+            pattern = f.read()
+    except OSError:
+        raise PassError("run refused: cannot verify core dump policy")
+    if pattern.startswith(("|", "@")):
+        raise PassError("run refused: external core dump collector is not supported")
+
+
+def disable_core_dumps():
+    # Runs in the child before pass-cli resolves any references. Both limits
+    # survive exec and fork; the sandbox cannot raise the hard limit again.
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    check_core_policy()
+
+
 def run_approved(a):
     bwrap = shutil.which("bwrap")
     if not bwrap:
         raise PassError("bwrap is not installed")
+    check_core_policy()
     argv, env = tuple(a["argv"]), dict(a["env"])
     shown, bindings = [], []
     for index, (name, ref) in enumerate(env.items()):
@@ -474,7 +494,9 @@ def run_approved(a):
         p = subprocess.Popen([PASS_CLI, "run", "--", bwrap, *sandbox, *launch, *argv],
                              env=cli_env(REASON, {src: ref for src, _, ref in bindings}),
                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                             start_new_session=True)
+                             start_new_session=True, preexec_fn=disable_core_dumps)
+    except subprocess.SubprocessError:
+        raise PassError("run refused: cannot disable core dumps")
     except OSError:
         raise PassError("pass-cli failed to start")
     try:
