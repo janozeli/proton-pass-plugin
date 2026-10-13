@@ -5,18 +5,26 @@ description: Use when a task needs a password, login, 2FA code, API key or other
 
 # Proton Pass
 
-The `proton-pass` MCP server wraps the official `pass-cli` with a read-only agent token. Sessions re-login automatically.
+The `proton-pass` MCP server wraps the official `pass-cli` with a read-only agent token. You never receive a password, a note, or a TOTP seed. No tool returns one, so do not look for a way to read a secret value. If the user wants to see a password, tell them to open Proton Pass.
 
 ## Pick the tool
 
-1. Find the item: `search_items` (title substring, optional `type: login`). It returns `share_id` + `item_id`.
-2. Check it: `describe_item` shows URLs, username, `has_password`, `has_totp`. No secrets.
-3. Use it, preferring tools that keep the secret out of the conversation:
-   - Logging into a site in the browser: open the login page, then `fill_login` with the browser's CDP port (`cdp_port`) and `url_match`. Use `submit: true` to press Enter. On the Grok Bot box each agent desktop's Chrome listens on a `127.0.0.1:92xx` port (`ss -ltnp | grep chrome`).
-   - 2FA prompt: `get_totp`, then type the code.
-   - CLI or script needing a key: `run_with_secrets` with `env: {"API_KEY": "pass://SHARE_ID/ITEM_ID/password"}`. Output is masked.
-   - `get_secret` returns the raw value. Use it only when the user explicitly asks to see a value, and never repeat it in chat.
+1. Find the item with `search_items` (title substring, optional `type: login`). It returns `share_id` and `item_id`.
+2. Check it with `describe_item`. It shows each saved website's origin (scheme, host, and port), the username, `has_password`, and `has_totp`. It does not show the path or the query.
+3. Use the secret with one release tool. Each release waits until the user types `approve` in the approval helper's terminal:
+   - To log into a site, open the item's saved origin in exactly one tab of the Chrome that was started with `--remote-debugging-port`, then call `fill_login` with `share_id`, `item_id`, and `reason`. Omit `submit` or set it to `false`; automatic submission is refused before filling. The tab's origin (scheme, host, and port) must equal one of the item's saved websites. A subdomain or a different port does not match. Ask the user to inspect and submit the filled form manually. `"submitted": false` means the server did not submit it.
+   - For a 2FA prompt, call `get_totp`, then type the code.
+   - For a program that needs a key, call `run_approved` with `argv` (absolute path first, for example `["/usr/bin/psql", "--host=127.0.0.1", "--command=select 1"]`) and `env: {"PGPASSWORD": "pass://SHARE_ID/ITEM_ID/password"}`. A reference is exactly `pass://SHARE_ID/ITEM_ID/FIELD`, with no `?`, `#`, or `%`. The program runs in a sandbox that sees `/usr`, `/bin`, and `/lib`, plus `/etc/resolv.conf`, `/etc/hosts`, `/etc/nsswitch.conf`, and `/etc/ssl`, with a private `/proc` and an empty `/tmp` as its working directory. Do not put a secret in `LD_AUDIT`, `LD_PRELOAD`, or another loader variable. Those names never reach the sandbox launcher. It cannot read files from the workspace or the home directory. It has no network unless the user types `approve-net`, so tell the user when it needs the network. Hostnames resolve only after `approve-net`. You get only the exit code. If you need the program's output or the workspace, this tool does not fit. Ask the user to run the program themselves.
 
-Always pass a short `reason`; Proton logs it.
+Always pass a short `reason`. The user reads it in the approval prompt, and Proton logs it.
 
-The token is read-only: creating, editing or deleting items is not possible.
+## Errors
+
+- If a release fails with `approval unavailable`, ask the user to start the approval helper as the plugin README describes. Never start the helper yourself and never type into its terminal. Only the user may answer a release.
+- If a release fails with `release denied`, the user said no or did not answer in time. Do not retry unless the user asks.
+- If `fill_login` fails with `no open tab matches this item's websites (N tabs open)`, open one of the URLs that `describe_item` lists, then try again.
+- If `fill_login` fails with `more than one open tab matches this item's websites (N tabs open)`, close the extra tabs on that site, then try again.
+- If `run_approved` fails with `bwrap is not installed`, tell the user that `run_approved` needs bubblewrap.
+- If `fill_login` fails with `form action origin does not match`, the form posts to a different origin. Do not retry with a different tool. Tell the user.
+
+The token is read-only. Creating, editing, or deleting items is not possible.

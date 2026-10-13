@@ -3,12 +3,7 @@
     "proton-pass": {
       "type": "stdio",
       "command": "python3",
-      "args": ["${CURSOR_PLUGIN_ROOT}/server/proton_pass_mcp.py"],
-      "env": {
-        "PASS_CLI": "~/.local/bin/pass-cli",
-        "PASS_PAT_FILE": "~/.config/pass-agent/pat",
-        "PROTON_PASS_SESSION_DIR": "/tmp/pass-agent-mcp"
-      }
+      "args": ["${CURSOR_PLUGIN_ROOT}/server/proton_pass_mcp.py"]
     }
   }
 }
