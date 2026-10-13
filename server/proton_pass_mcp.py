@@ -372,18 +372,18 @@ FILL = """function(arg) {
   };
   const before = shown.slice(0, shown.indexOf(pw)).filter(el => el.form === pw.form && ["text", "email", "tel"].includes(el.type));
   const user = before.find(el => /username|email/.test(el.autocomplete)) || before[before.length - 1];
-  const filled = [];
-  if (user && arg.username) {
-    set(user, arg.username);
-    if (eligible(user) && user.value === arg.username) filled.push("username");
-  }
+  if (user && arg.username) set(user, arg.username);
   // Username events may synchronously replace, hide, or disable the target.
   pw = inputs().find(el => el.type === "password");
   if (!pw) return [];
+  const form = pw.form;
   set(pw, arg.password);
   pw.focus();
   // Input, change, and focus handlers can also invalidate the completed fill.
-  if (!eligible(pw) || pw.type !== "password" || pw.value !== arg.password) return [];
+  if (!eligible(pw) || pw.type !== "password" || pw.form !== form || pw.value !== arg.password) return [];
+  const filled = [];
+  if (user && arg.username && eligible(user) && ["text", "email", "tel"].includes(user.type) &&
+      user.form === form && user.value === arg.username) filled.push("username");
   filled.push("password");
   return filled;
 }"""
