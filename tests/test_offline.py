@@ -187,6 +187,73 @@ finally:
         assert libc.shmctl(host_id, 0, None) == 0
 
 
+def _check_inherited_keyring():
+    # Run in a subprocess so joining a fresh, anonymous session keyring never
+    # changes the test runner's keyring or any real user keys.
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.syscall.restype = ctypes.c_long
+    seccomp = ctypes.CDLL("libseccomp.so.2")
+    seccomp.seccomp_syscall_resolve_name.argtypes = [ctypes.c_char_p]
+    numbers = [seccomp.seccomp_syscall_resolve_name(name) for name in
+               (b"add_key", b"request_key", b"keyctl")]
+    assert all(n >= 0 for n in numbers), numbers
+    add, request, keyctl = numbers
+    ring = libc.syscall(keyctl, 1, None)  # KEYCTL_JOIN_SESSION_KEYRING
+    assert ring > 0, ctypes.get_errno()
+    code = r"""import ctypes,errno,os,sys
+c=ctypes.CDLL(None,use_errno=True)
+c.syscall.restype=ctypes.c_long
+add,request,keyctl,probe=map(int,sys.argv[1:])
+secret=os.environ['PW'].encode()
+failed=0
+for bit,n,args in [(1,add,(b'user',b'leak',secret,len(secret),-3)),
+                   (2,request,(b'user',b'host-probe',None,0)),
+                   (4,keyctl,(2,probe,secret,len(secret)))]:
+ ctypes.set_errno(0)
+ result=c.syscall(n,*args)
+ if result!=-1 or ctypes.get_errno()!=errno.EPERM: failed|=bit
+sys.exit(failed)
+"""
+    failures = []
+    try:
+        for approval in ("allow", "allow-net"):
+            probe = libc.syscall(add, b"user", b"host-probe", b"host-only", 9, ring)
+            assert probe > 0, ctypes.get_errno()
+            buf = ctypes.create_string_buffer(128)
+            assert libc.syscall(keyctl, 11, probe, buf, len(buf)) == 9  # KEYCTL_READ
+            assert buf.value == b"host-only"
+            assert libc.syscall(request, b"user", b"host-probe", None, 0) == probe
+            d, c = start()
+            op = Operator(d, {"op": approval})
+            try:
+                got = c.call("run_approved", argv=["/usr/bin/python3", "-c", code,
+                             *map(str, numbers), str(probe)], env={"PW": REF}, reason="check keyring isolation")
+                leaked = libc.syscall(keyctl, 10, ring, b"user", b"leak", 0)  # KEYCTL_SEARCH
+                if leaked >= 0:
+                    size = libc.syscall(keyctl, 11, leaked, buf, len(buf))
+                    failures.append((approval, "credential recoverable outside sandbox", buf.raw[:size] == PIN.encode()))
+                else:
+                    assert ctypes.get_errno() == errno.ENOKEY, ctypes.get_errno()
+                size = libc.syscall(keyctl, 11, probe, buf, len(buf))
+                if buf.raw[:size] != b"host-only":
+                    failures.append((approval, "host key modified"))
+                if got != {"exit_code": 0}:
+                    failures.append((approval, "keyring syscalls were not all denied with EPERM", got))
+            finally:
+                op.close()
+                c.close()
+                assert libc.syscall(keyctl, 7, ring) == 0  # KEYCTL_CLEAR
+        assert not failures, failures
+    finally:
+        libc.syscall(keyctl, 7, ring)
+
+
+def test_run_cannot_publish_credentials_in_an_inherited_keyring():
+    result = subprocess.run([sys.executable, "-c", "from test_offline import _check_inherited_keyring; _check_inherited_keyring()"],
+                            cwd=os.path.dirname(__file__), capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+
+
 def test_run_executes_a_shell_only_when_the_operator_approved_that_argv():
     d, c = start()
     op = Operator(d)
