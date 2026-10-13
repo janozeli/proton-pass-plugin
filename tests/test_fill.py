@@ -180,6 +180,63 @@ def test_fill_skips_inputs_without_positive_dimensions(lab):
 <input id=hpw type=password style="{size};padding:0;border:0">""")
 
 
+def test_fill_reselects_password_replaced_by_username_events(lab):
+    d, c = server(lab)
+    op = Operator(d)
+    try:
+        for event in ("input", "change"):
+            with tab(lab, "/login.html") as page:
+                page.evaluate("""event => {
+                  document.querySelector('#user').addEventListener(event, () => {
+                    const pw = document.querySelector('#pw');
+                    window.detachedPassword = pw;
+                    pw.replaceWith(pw.cloneNode());
+                  });
+                }""", event)
+                assert c.call("fill_login", **ITEM) == {"filled": ["username", "password"], "submitted": False}
+                assert value(page, "#pw") == PASSWORD
+                assert page.evaluate("window.detachedPassword.value") == ""
+    finally:
+        op.close()
+        c.close()
+
+
+def test_fill_refuses_password_invalidated_by_username_events(lab):
+    d, c = server(lab)
+    op = Operator(d)
+    try:
+        for change in ("pw.remove()", "pw.disabled = true", "pw.readOnly = true", "pw.hidden = true",
+                       "pw.type = 'text'", "pw.style.cssText = 'width:0;height:0;padding:0;border:0'"):
+            with tab(lab, "/login.html") as page:
+                page.evaluate("""change => {
+                  window.originalPassword = document.querySelector('#pw');
+                  document.querySelector('#user').addEventListener('input', () => {
+                    const pw = window.originalPassword;
+                    eval(change);
+                  });
+                }""", change)
+                assert error(c, "fill_login", **ITEM) == "no password field on the matching tab"
+                assert page.evaluate("window.originalPassword.value") == ""
+    finally:
+        op.close()
+        c.close()
+
+
+def test_fill_does_not_report_password_lost_during_its_events(lab):
+    d, c = server(lab)
+    op = Operator(d)
+    try:
+        for event, action in (("input", "this.value = ''"), ("change", "this.replaceWith(this.cloneNode())"),
+                              ("focus", "this.value = ''")):
+            with tab(lab, "/login.html") as page:
+                page.eval_on_selector("#pw", "(el, [event, action]) => el.setAttribute('on'+event, action)",
+                                      [event, action])
+                assert error(c, "fill_login", **ITEM) == "no password field on the matching tab"
+    finally:
+        op.close()
+        c.close()
+
+
 def test_fill_refuses_automatic_submission_without_filling_or_approval(lab):
     d, c = server(lab)
     op = Operator(d)
