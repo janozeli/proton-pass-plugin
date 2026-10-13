@@ -354,9 +354,17 @@ def get_totp(a):
 
 FILL = """function(arg) {
   if (location.origin !== arg.origin) return null;
+  const inert = el => {
+    for (let node = el; node; node = node.parentElement) {
+      if (node.hasAttribute('inert')) return true;
+      // Modal dialogs escape ancestor inertness, but not their own inert attribute.
+      if (node.matches('dialog:modal')) return false;
+    }
+    return false;
+  };
   const eligible = el => {
     const box = el.getBoundingClientRect();
-    return el.isConnected && !el.matches(':disabled') && !el.closest('[inert]') &&
+    return el.isConnected && !el.matches(':disabled') && !inert(el) &&
       !el.readOnly && box.width > 0 && box.height > 0 &&
       el.checkVisibility({visibilityProperty: true, opacityProperty: true});
   };
