@@ -239,6 +239,81 @@ def test_fill_rejects_nonmodal_dialog_inside_inert_ancestor(lab):
         c.close()
 
 
+def test_fill_only_uses_topmost_modal_in_opening_order(lab):
+    d, c = server(lab)
+    op = Operator(d)
+    try:
+        for order in (("lower", "upper"), ("upper", "lower"), ("lower", "upper", "lower")):
+            for ancestor in ("", "inert"):
+                with tab(lab, "/login.html") as page:
+                    page.set_content(f"""<form><input id=outside-user><input id=outside-pw type=password></form>
+<div {ancestor}><dialog id=lower><form><input id=lower-user><input id=lower-pw type=password></form></dialog></div>
+<dialog id=upper><form><input id=upper-user><input id=upper-pw type=password></form></dialog>""")
+                    page.evaluate("""order => order.forEach(id => {
+                      const dialog = document.getElementById(id);
+                      if (dialog.open) dialog.close();
+                      dialog.showModal();
+                    })""", order)
+                    assert c.call("fill_login", **ITEM) == {"filled": ["username", "password"], "submitted": False}
+                    for name in ("outside", "lower", "upper"):
+                        expected = ["ada", PASSWORD] if name == order[-1] else ["", ""]
+                        assert [value(page, f"#{name}-{field}") for field in ("user", "pw")] == expected, (order, ancestor, name)
+    finally:
+        op.close()
+        c.close()
+
+
+def test_fill_skips_nested_inert_controls_inside_topmost_modal(lab):
+    d, c = server(lab)
+    op = Operator(d)
+    try:
+        with tab(lab, "/login.html") as page:
+            page.set_content("""<dialog id=lower><form><input id=lower-user><input id=lower-pw type=password></form></dialog>
+<div inert><dialog id=upper><div inert><div><form>
+<input id=blocked-user><input id=blocked-pw type=password></form></div></div>
+<form><input id=user><input id=pw type=password></form></dialog></div>""")
+            page.evaluate("lower.showModal(); upper.showModal()")
+            assert c.call("fill_login", **ITEM) == {"filled": ["username", "password"], "submitted": False}
+            assert [value(page, s) for s in ("#lower-user", "#lower-pw", "#blocked-user", "#blocked-pw", "#user", "#pw")] == ["", "", "", "", "ada", PASSWORD]
+    finally:
+        op.close()
+        c.close()
+
+
+def test_fill_reselects_password_after_username_opens_another_modal(lab):
+    d, c = server(lab)
+    op = Operator(d)
+    try:
+        for event in ("input", "change"):
+            with tab(lab, "/login.html") as page:
+                page.set_content(f"""<dialog id=lower><form><input id=user on{event}="upper.showModal()">
+<input id=oldpw type=password></form></dialog>
+<dialog id=upper><form><input id=pw type=password></form></dialog>""")
+                page.evaluate("lower.showModal()")
+                assert c.call("fill_login", **ITEM) == {"filled": ["password"], "submitted": False}, event
+                assert value(page, "#oldpw") == "", event
+                assert value(page, "#pw") == PASSWORD, event
+    finally:
+        op.close()
+        c.close()
+
+
+def test_fill_revalidates_modal_inertness_after_password_events(lab):
+    d, c = server(lab)
+    op = Operator(d)
+    try:
+        for event in ("input", "change", "focus"):
+            for action in ("upper.showModal()", "this.parentElement.inert = true"):
+                with tab(lab, "/login.html") as page:
+                    page.set_content(f"""<dialog id=lower><form><input id=user><div><input id=pw type=password
+on{event}="{action}"></div></form></dialog><dialog id=upper><button>Continue</button></dialog>""")
+                    page.evaluate("lower.showModal()")
+                    assert error(c, "fill_login", **ITEM) == "no password field on the matching tab", (event, action)
+    finally:
+        op.close()
+        c.close()
+
+
 def test_fill_reselects_password_when_username_events_disable_its_ancestor(lab):
     d, c = server(lab)
     op = Operator(d)
