@@ -146,6 +146,33 @@ def test_fill_types_only_into_the_visible_main_frame_password_of_the_item_origin
         c.close()
 
 
+def assert_fill_skips_transparent_fields(lab, hidden):
+    d, c = server(lab)
+    op = Operator(d)
+    try:
+        with tab(lab, "/login.html") as page:
+            page.set_content(f"""<form>{hidden}
+<input id=user name=username><input id=pw type=password></form>""")
+            got = c.call("fill_login", **ITEM)
+            assert got == {"filled": ["username", "password"], "submitted": False}, got
+            assert [value(page, s) for s in ("#huser", "#hpw")] == ["", ""]
+            assert [value(page, s) for s in ("#user", "#pw")] == ["ada", PASSWORD]
+    finally:
+        op.close()
+        c.close()
+
+
+def test_fill_skips_inputs_with_zero_opacity(lab):
+    assert_fill_skips_transparent_fields(lab, """
+<input id=huser autocomplete=username style="opacity:0">
+<input id=hpw type=password style="opacity:0">""")
+
+
+def test_fill_skips_inputs_with_a_zero_opacity_ancestor(lab):
+    assert_fill_skips_transparent_fields(lab, """<div style="opacity:0"><div>
+<input id=huser autocomplete=username><input id=hpw type=password></div></div>""")
+
+
 def test_fill_refuses_automatic_submission_without_filling_or_approval(lab):
     d, c = server(lab)
     op = Operator(d)
