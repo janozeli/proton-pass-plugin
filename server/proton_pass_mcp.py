@@ -297,12 +297,6 @@ FILL = """function(arg) {
   const shown = [...document.querySelectorAll("input")].filter(el => !el.disabled && !el.readOnly && el.checkVisibility({visibilityProperty: true}));
   const pw = shown.find(el => el.type === "password");
   if (!pw) return [];
-  if (arg.submit) {
-    let actionOrigin;
-    try { actionOrigin = new URL(pw.form ? pw.form.action : location.href, location.href).origin; }
-    catch (e) { return "bad-action"; }
-    if (actionOrigin !== arg.origin) return "bad-action";
-  }
   const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
   const set = (el, v) => {
     setter.call(el, v);
@@ -318,14 +312,6 @@ FILL = """function(arg) {
   pw.focus();
   return filled;
 }"""
-
-CLEAR = """function(arg) {
-  if (location.origin === arg.origin) return;
-  for (const el of document.querySelectorAll("input, textarea")) {
-    if (el.type === "password" || (arg.password && String(el.value).includes(arg.password))) el.value = "";
-  }
-}"""
-
 
 def cdp_endpoint():
     try:
@@ -349,6 +335,8 @@ def cdp_endpoint():
 
 
 def fill_login(a):
+    if a.get("submit", False):
+        raise PassError("automatic submission is unavailable; fill without submit and submit manually")
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -378,15 +366,9 @@ def fill_login(a):
             got = isolated(page, FILL, secret)
             if got is None:
                 raise PassError(f"no open tab matches this item's websites ({len(pages)} tabs open)")
-            if got == "bad-action":
-                raise PassError("form action origin does not match")
             filled = [f for f in ("username", "password") if isinstance(got, list) and f in got]
             if not filled:
                 raise PassError("no password field on the matching tab")
-            if submit:
-                page.keyboard.press("Enter")
-                page.wait_for_timeout(1000)
-                isolated(page, CLEAR, secret)
         finally:
             browser.close()
     return {"filled": filled, "submitted": submit}
@@ -511,7 +493,7 @@ TOOLS = {
                      {"query": S, "vault": S, "type": {"type": "string", "enum": ["login", "note", "alias", "credit-card", "identity", "ssh-key", "wifi", "custom"]}, "limit": {"type": "integer"}}, []),
     "describe_item": (describe_item, "Item metadata: website origins (scheme, host, and port only), username, email, has_password, has_totp, extra field names. No path, query, fragment, or secret values.", ITEM, ["share_id", "item_id"]),
     "get_totp": (get_totp, "Current TOTP code from the item's totp field, after the operator approves in the approval terminal. Returns only the digits.", ITEM, ["share_id", "item_id", "reason"]),
-    "fill_login": (fill_login, "After the operator approves, type the item's username and password into the one open Chrome tab whose origin equals one of the item's saved websites. The password never comes back. submit presses Enter; submitted means Enter was pressed, not that the login worked.",
+    "fill_login": (fill_login, "After the operator approves, type the item's username and password into the one open Chrome tab whose origin equals one of the item's saved websites. The password never comes back. Automatic submission is refused: omit submit or set it to false, then submit manually. submitted is always false.",
                    {**ITEM, "submit": {"type": "boolean"}}, ["share_id", "item_id", "reason"]),
     "run_approved": (run_approved, "After the operator approves this exact argv, run it in a bubblewrap sandbox with pass://SHARE_ID/ITEM_ID/FIELD references injected as environment variables. The sandbox sees /usr, /bin, and /lib read-only, /etc name-service and TLS files, and an empty /tmp. It has no network unless the operator allows it. Output is discarded. Returns only the exit code.",
                      {"argv": {"type": "array", "items": S, "description": "Absolute path of the program, then its arguments. No shell is added."},
