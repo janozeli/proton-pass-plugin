@@ -292,6 +292,74 @@ def test_fill_does_not_report_password_lost_during_its_events(lab):
         c.close()
 
 
+def test_fill_does_not_report_username_cleared_by_password_events(lab):
+    d, c = server(lab)
+    op = Operator(d)
+    try:
+        for event in ("input", "change", "focus"):
+            with tab(lab, "/login.html") as page:
+                page.eval_on_selector("#pw", "(el, event) => el.setAttribute('on'+event, \"document.querySelector('#user').value = ''\")", event)
+                got = c.call("fill_login", **ITEM)
+                assert value(page, "#user") == "", event
+                assert got == {"filled": ["password"], "submitted": False}, (event, got)
+                assert value(page, "#pw") == PASSWORD
+    finally:
+        op.close()
+        c.close()
+
+
+def test_fill_revalidates_username_eligibility_and_form_after_password_events(lab):
+    d, c = server(lab)
+    op = Operator(d)
+    try:
+        for action in ("user.remove()", "user.disabled = true", "user.readOnly = true", "user.hidden = true",
+                       "user.type = 'password'", "user.setAttribute('form', 'other')",
+                       "user.parentElement.disabled = true", "user.parentElement.inert = true"):
+            with tab(lab, "/login.html") as page:
+                page.set_content("""<form><fieldset><input id=user></fieldset><input id=pw type=password></form>
+<form id=other></form>""")
+                page.evaluate("""action => {
+                  document.querySelector('#pw').addEventListener('input', () => {
+                    const user = document.querySelector('#user');
+                    eval(action);
+                  });
+                }""", action)
+                got = c.call("fill_login", **ITEM)
+                assert got == {"filled": ["password"], "submitted": False}, (action, got)
+                assert value(page, "#pw") == PASSWORD
+    finally:
+        op.close()
+        c.close()
+
+
+def test_fill_refuses_password_moved_to_another_form_during_its_events(lab):
+    d, c = server(lab)
+    op = Operator(d)
+    try:
+        with tab(lab, "/login.html") as page:
+            page.set_content("""<form><input id=user><input id=pw type=password
+onchange="this.setAttribute('form', 'other')"></form><form id=other></form>""")
+            assert error(c, "fill_login", **ITEM) == "no password field on the matching tab"
+    finally:
+        op.close()
+        c.close()
+
+
+def test_fill_reports_username_restored_by_later_password_events(lab):
+    d, c = server(lab)
+    op = Operator(d)
+    try:
+        with tab(lab, "/login.html") as page:
+            page.set_content("""<form><input id=user oninput="this.value = ''"><input id=pw type=password
+onfocus="document.querySelector('#user').value = 'ada'"></form>""")
+            got = c.call("fill_login", **ITEM)
+            assert [value(page, s) for s in ("#user", "#pw")] == ["ada", PASSWORD]
+            assert got == {"filled": ["username", "password"], "submitted": False}, got
+    finally:
+        op.close()
+        c.close()
+
+
 def test_fill_refuses_automatic_submission_without_filling_or_approval(lab):
     d, c = server(lab)
     op = Operator(d)
