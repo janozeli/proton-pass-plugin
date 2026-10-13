@@ -352,15 +352,20 @@ def get_totp(a):
     return {"code": code}
 
 
-FILL = """function(arg) {
+FILL = """function*(arg) {
+  // Each yield refreshes Chromium's top-layer order after page event handlers.
+  let topLayer = yield;
   if (location.origin !== arg.origin) return null;
+  const parent = node => node.assignedSlot || node.parentElement || node.getRootNode().host;
   const inert = el => {
-    for (let node = el; node; node = node.parentElement) {
+    const modal = topLayer.findLast(node => node instanceof HTMLDialogElement && node.matches(':modal'));
+    for (let node = el; node; node = parent(node)) {
       if (node.hasAttribute('inert')) return true;
-      // Modal dialogs escape ancestor inertness, but not their own inert attribute.
-      if (node.matches('dialog:modal')) return false;
+      // Only the topmost modal escapes its ancestors' explicit inertness.
+      if (node === modal) return false;
     }
-    return false;
+    // With a modal open, everything outside its flat-tree subtree is inert.
+    return !!modal;
   };
   const eligible = el => {
     const box = el.getBoundingClientRect();
@@ -382,12 +387,16 @@ FILL = """function(arg) {
   const user = before.find(el => /username|email/.test(el.autocomplete)) || before[before.length - 1];
   if (user && arg.username) set(user, arg.username);
   // Username events may synchronously replace, hide, or disable the target.
+  topLayer = yield;
+  if (location.origin !== arg.origin) return null;
   pw = inputs().find(el => el.type === "password");
   if (!pw) return [];
   const form = pw.form;
   set(pw, arg.password);
   pw.focus();
   // Input, change, and focus handlers can also invalidate the completed fill.
+  topLayer = yield;
+  if (location.origin !== arg.origin) return null;
   if (!eligible(pw) || pw.type !== "password" || pw.form !== form || pw.value !== arg.password) return [];
   const filled = [];
   if (user && arg.username && eligible(user) && ["text", "email", "tel"].includes(user.type) &&
@@ -446,7 +455,7 @@ def fill_login(a):
                      "reason": a["reason"]})
             secret = {"origin": allowed, "username": lg.get("username") or lg.get("email") or "",
                       "password": lg["password"], "submit": submit}
-            got = isolated(page, FILL, secret)
+            got = isolated_fill(page, secret)
             if got is None:
                 raise PassError(f"no open tab matches this item's websites ({len(pages)} tabs open)")
             filled = [f for f in ("username", "password") if isinstance(got, list) and f in got]
@@ -457,22 +466,49 @@ def fill_login(a):
     return {"filled": filled, "submitted": submit}
 
 
-def isolated(page, source, arg):
+def isolated_fill(page, arg):
+    session = page.context.new_cdp_session(page)
+
+    def call(params):
+        result = session.send("Runtime.callFunctionOn", params)
+        if result.get("exceptionDetails") is not None:
+            raise PassError("internal error")
+        return result["result"]
+
     try:
-        session = page.context.new_cdp_session(page)
         frame = session.send("Page.getFrameTree")["frameTree"]["frame"]["id"]
         world = session.send("Page.createIsolatedWorld", {"frameId": frame, "worldName": "proton-pass"})
-        result = session.send("Runtime.callFunctionOn", {
-            "functionDeclaration": source,
+        session.send("DOM.enable")
+        session.send("DOM.getDocument")
+        generator = call({
+            "functionDeclaration": FILL,
             "executionContextId": world["executionContextId"],
             "arguments": [{"value": arg}],
-            "returnByValue": True,
+            "objectGroup": "proton-pass-fill",
         })
+        step = {"objectId": generator["objectId"], "returnByValue": True}
+        result = call({**step, "functionDeclaration": "function() { return this.next(); }"})["value"]
+        while not result["done"]:
+            # :modal is in DOM order; CDP exposes the actual bottom-to-top order,
+            # including backdrops and popovers (which the inert predicate ignores).
+            nodes = session.send("DOM.getTopLayerElements")["nodeIds"]
+            arguments = []
+            for node in nodes:
+                obj = session.send("DOM.resolveNode", {
+                    "nodeId": node, "executionContextId": world["executionContextId"],
+                    "objectGroup": "proton-pass-fill",
+                })["object"]
+                arguments.append({"objectId": obj["objectId"]})
+            result = call({**step, "functionDeclaration": "function(...layer) { return this.next(layer); }",
+                           "arguments": arguments})["value"]
+        return result.get("value")
     except (OSError, KeyError, TypeError):
         raise PassError("internal error")
-    if result.get("exceptionDetails") is not None:
-        raise PassError("internal error")
-    return result.get("result", {}).get("value")
+    finally:
+        try:
+            session.send("Runtime.releaseObjectGroup", {"objectGroup": "proton-pass-fill"})
+        finally:
+            session.detach()
 
 
 def ref_parts(ref):
