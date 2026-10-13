@@ -1,85 +1,376 @@
-import json, os, stat, tempfile
-from mcp_client import Client
+import fcntl, json, os, select, socket, stat, subprocess, sys, tempfile, termios
+from harness import (HOST_SECRET, PASSWORD, PIN, SEED, SERVER, TOKEN, Operator, calls, child, error, install,
+                     server_env, session, start, write)
 
-TOKEN = "pst-TEST-TOKEN-value"
-PASSWORD = "hunter2-secret-value"
-SEED = "SEEDSECRETVALUE"
-
-
-def install_fake(d, token=TOKEN):
-    os.makedirs(d, exist_ok=True)
-    open(os.path.join(d, "password"), "w").write(PASSWORD)
-    item = {"item": {
-        "id": "item1", "share_id": "share1",
-        "content": {
-            "title": "Bank", "note": "",
-            "content": {"Login": {
-                "username": "ada", "email": "ada@example.com", "password": PASSWORD,
-                "totp_uri": f"otpauth://totp/Bank?secret={SEED}",
-                "urls": ["https://bank.com/login"],
-            }},
-            "extra_fields": [{"name": "api"}],
-        },
-    }}
-    open(os.path.join(d, "item.json"), "w").write(json.dumps(item))
-    fake = os.path.join(d, "pass-cli")
-    open(fake, "w").write(f"""#!/bin/bash
-echo "$*" >> {d}/calls
-if [ -n "${{PROTON_PASS_SESSION_DIR:-}}" ]; then printf '%s' "$PROTON_PASS_SESSION_DIR" > {d}/session; fi
-if [ "$1" = login ]; then
-  printf '%s' "${{PROTON_PASS_PERSONAL_ACCESS_TOKEN-}}" > {d}/seen-token
-  if [ -f {d}/login-fail ]; then echo "rejected ${{PROTON_PASS_PERSONAL_ACCESS_TOKEN-}}" >&2; exit 1; fi
-  touch {d}/ok; exit 0
-fi
-if [ ! -f {d}/ok ]; then echo "Error: This operation requires an authenticated client" >&2; exit 1; fi
-if [ -f {d}/not-a-login ]; then echo "Error: item is not a login" >&2; exit 1; fi
-if [ -f {d}/fail-with-secrets ]; then echo "err tok=$(cat {d}/seen-token) pw=$(cat {d}/password)" >&2; exit 1; fi
-if [ "$1" = vault ]; then echo '{{"vaults":[{{"name":"V","vault_id":"v","share_id":"share1"}}]}}'; exit 0; fi
-if [ "$1" = item ] && [ "$2" = list ]; then
-  echo '{{"items":[{{"title":"Bank","item_type":"login","share_id":"share1","id":"item1","modify_time":1,"state":"Active"}},{{"title":"Old","item_type":"login","share_id":"share1","id":"item2","modify_time":1,"state":"Trashed"}}]}}'
-  exit 0
-fi
-if [ "$1" = item ] && [ "$2" = view ]; then
-  case " $* " in
-    *" --field "*) printf '%s\\n' "$(cat {d}/password)"; exit 0 ;;
-  esac
-  if [ -f {d}/bad-json ]; then printf 'NOT JSON %s\\n' "$(cat {d}/password)"; exit 0; fi
-  cat {d}/item.json; exit 0
-fi
-if [ "$1" = item ] && [ "$2" = totp ]; then echo '{{"code":"123456"}}'; exit 0; fi
-if [ "$1" = run ]; then
-  printf '%s' "${{PW-}}" > {d}/env-pw
-  if [ -f {d}/echo-secrets ]; then echo "tok=$(cat {d}/seen-token) pw=$(cat {d}/password)"; else echo done; fi
-  exit 0
-fi
-echo "unexpected: $*" >&2; exit 1
-""")
-    os.chmod(fake, 0o755)
-    pat = os.path.join(d, "pat")
-    open(pat, "w").write(token + "\n")
-    os.chmod(pat, 0o600)
-    return fake, pat
+ISOLATE = ["/usr/bin/unshare", "--user", "--net", "--map-root-user", "--"]
+STRIP = ["/usr/bin/env", "-u", "PROTON_PASS_SESSION_DIR", "-u", "PROTON_PASS_AGENT_REASON",
+         "-u", "PROTON_PASS_PERSONAL_ACCESS_TOKEN", "-u", "PASS_PAT_FILE", "-u", "PASS_CLI", "--"]
+REF = "pass://share1/item1/pin"
 
 
-def calls(d):
-    p = os.path.join(d, "calls")
-    return open(p).read().splitlines() if os.path.exists(p) else []
+def runs(d):
+    return [a for a in calls(d) if a[:1] == ["run"]]
 
 
-def start(d, chmod_pat=0o600, drop=(), token=TOKEN, **env):
-    fake, pat = install_fake(d, token)
-    os.chmod(pat, chmod_pat)
-    home = os.path.join(d, "home")
-    os.makedirs(home, exist_ok=True)
-    base = {"HOME": home, "PASS_CLI": fake, "PASS_PAT_FILE": pat,
-            "PROTON_PASS_SESSION_DIR": os.path.join(d, "session")}
-    base.update(env)
-    return Client(base, drop=drop)
+def logins(d):
+    return [a for a in calls(d) if a == ["login"]]
 
 
-def test_metadata_search_and_describe_hide_secrets():
-    d = tempfile.mkdtemp()
-    c = start(d)
+def startup(d, **env):
+    r = subprocess.run([sys.executable, SERVER], env=dict(os.environ, **server_env(d, **env)),
+                       stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+    return r.returncode, r.stderr
+
+
+def test_get_secret_and_run_with_secrets_are_unknown_tools():
+    d, c = start()
+    try:
+        assert (got := error(c, "get_secret", share_id="share1", item_id="item1")) == "unknown tool get_secret", got
+        assert (got := error(c, "run_with_secrets", command="env", env={"PW": REF})) == "unknown tool run_with_secrets", got
+        names = [t["name"] for t in c.rpc("tools/list")["tools"]]
+        assert names == ["list_vaults", "search_items", "describe_item", "get_totp", "fill_login", "run_approved"], names
+        assert calls(d) == [], calls(d)
+    finally:
+        c.close()
+
+
+def test_fill_login_rejects_url_match_selectors_and_cdp_port():
+    d, c = start()
+    try:
+        for key, value in (("url_match", "127.0.0.1:8765"), ("username_selector", "#q"),
+                           ("password_selector", "#q"), ("cdp_port", 9333)):
+            got = error(c, "fill_login", share_id="share1", item_id="item1", reason="log in", **{key: value})
+            assert got == f"unknown argument {key}", got
+        assert calls(d) == [], calls(d)
+    finally:
+        c.close()
+
+
+def test_startup_refuses_a_forbidden_parameter_name():
+    d = install()
+    code = ("import sys; sys.path.insert(0, %r); import proton_pass_mcp as m; "
+            "m.TOOLS['fill_login'][2]['cdp_port'] = {'type': 'integer'}; m.main()") % os.path.dirname(SERVER)
+    r = subprocess.run([sys.executable, "-c", code], env=dict(os.environ, **server_env(d)),
+                       stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+    assert (r.returncode, r.stderr) == (1, "proton-pass: forbidden tool or parameter name: cdp_port\n"), r
+
+
+def test_run_child_has_no_network_and_no_host_secrets_under_approve():
+    d, c = start()
+    op = Operator(d)
+    listener = socket.create_server(("127.0.0.1", 0))
+    listener.settimeout(0.5)
+    try:
+        argv, out = child(d, listener.getsockname()[1])
+        got = c.call("run_approved", argv=argv, env={"PW": REF}, reason="deploy")
+        assert got == {"exit_code": 7}, got
+        assert op.prompts == [{"action": "run", "argv": argv, "env": [["PW", REF, "Bank"]], "reason": "deploy"}], op.prompts
+        assert runs(d) == [["run", "--", *ISOLATE, *STRIP, *argv]], runs(d)
+        cli_env = json.load(open(os.path.join(d, "run-env.json")))
+        assert cli_env == {"PATH": os.environ["PATH"], "PROTON_PASS_SESSION_DIR": session(d),
+                           "PROTON_PASS_AGENT_REASON": "deploy", "PW": REF}, cli_env
+        seen = json.load(open(out))
+        assert seen["env"] == {"PATH": os.environ["PATH"], "PW": PIN}, seen["env"]
+        assert seen["net"] == "ENETUNREACH", seen["net"]
+        try:
+            listener.accept()
+            raise AssertionError("the child reached the listener without approve-net")
+        except TimeoutError:
+            pass
+        assert os.path.dirname(seen["cwd"]) == session(d) and os.path.basename(seen["cwd"]).startswith("run-"), seen
+        assert seen["mode"] == "0o700", seen["mode"]
+        assert not os.path.exists(seen["cwd"]), seen["cwd"]
+    finally:
+        listener.close()
+        op.close()
+        c.close()
+
+
+def test_run_child_reaches_the_network_only_under_approve_net():
+    d, c = start()
+    op = Operator(d, {"op": "allow-net"})
+    listener = socket.create_server(("127.0.0.1", 0))
+    listener.settimeout(5)
+    try:
+        argv, out = child(d, listener.getsockname()[1])
+        assert (got := c.call("run_approved", argv=argv, env={"PW": REF}, reason="deploy")) == {"exit_code": 7}, got
+        assert runs(d) == [["run", "--", *STRIP, *argv]], runs(d)
+        assert json.load(open(out))["net"] == "connected"
+        conn, _ = listener.accept()
+        assert conn.recv(16) == PIN.encode()
+        conn.close()
+    finally:
+        listener.close()
+        op.close()
+        c.close()
+
+
+def test_run_executes_a_shell_only_when_the_operator_approved_that_argv():
+    d, c = start()
+    op = Operator(d)
+    try:
+        assert (got := c.call("run_approved", argv=["/bin/sh", "-c", "exit 3"], env={"PW": REF}, reason="r")) == {"exit_code": 3}, got
+        assert op.prompts[0]["argv"] == ["/bin/sh", "-c", "exit 3"], op.prompts
+        assert runs(d) == [["run", "--", *ISOLATE, *STRIP, "/bin/sh", "-c", "exit 3"]], runs(d)
+    finally:
+        op.close()
+        c.close()
+
+
+def test_run_fails_closed_and_ignores_an_argv_in_the_reply():
+    d, c = start()
+    try:
+        argv, out = child(d)
+        assert (got := error(c, "run_approved", argv=argv, env={"PW": REF}, reason="r")) == "approval helper is not running", got
+        op = Operator(d, {"op": "deny"})
+        assert (got := error(c, "run_approved", argv=argv, env={"PW": REF}, reason="r")) == "release denied", got
+        op.close()
+        assert runs(d) == [] and not os.path.exists(out), runs(d)
+        pwned = os.path.join(d, "pwned")
+        op = Operator(d, {"op": "allow", "argv": ["/bin/sh", "-c", f"touch {pwned}"]})
+        assert (got := c.call("run_approved", argv=argv, env={"PW": REF}, reason="r")) == {"exit_code": 7}, got
+        op.close()
+        assert runs(d) == [["run", "--", *ISOLATE, *STRIP, *argv]], runs(d)
+        assert not os.path.exists(pwned)
+    finally:
+        c.close()
+
+
+def test_run_rejects_relative_argv_reserved_names_and_literal_values():
+    d, c = start()
+    op = Operator(d)
+    try:
+        cases = (
+            ({"argv": ["sh", "-c", "env"], "env": {"PW": REF}}, "argv[0] must be an absolute path"),
+            ({"argv": [], "env": {"PW": REF}}, "argv must not be empty"),
+            ({"argv": ["/bin/true"], "env": {"PATH": REF}}, "env name PATH is reserved"),
+            ({"argv": ["/bin/true"], "env": {"LD_PRELOAD": REF}}, "env name LD_PRELOAD is reserved"),
+            ({"argv": ["/bin/true"], "env": {"PW": "literal-secret-value"}},
+             "env PW must be a pass://SHARE_ID/ITEM_ID/FIELD reference"),
+            ({"argv": ["/bin/true"], "env": {"BAD-NAME": REF}}, "invalid env name BAD-NAME"),
+        )
+        for args, want in cases:
+            got = error(c, "run_approved", reason="r", **args)
+            assert got == want, (args, got)
+        assert calls(d) == [] and op.prompts == [], (calls(d), op.prompts)
+    finally:
+        op.close()
+        c.close()
+
+
+def test_describe_item_drops_url_userinfo():
+    d, c = start(urls=["https://user:URLPASS-CANARY@bank.example/login", "bank.com/login", "https://[broken/x"])
+    try:
+        got = c.call("describe_item", share_id="share1", item_id="item1", reason="r")
+        assert got["urls"] == ["https://bank.example/login", "https://bank.com/login"], got["urls"]
+    finally:
+        c.close()
+
+
+def test_pass_cli_stderr_never_reaches_the_tool_error():
+    d, c = start()
+    try:
+        c.call("list_vaults")
+        write(d, "stderr", f"Error: boom tok={TOKEN} pw={PASSWORD} STDERR-CANARY")
+        assert (got := error(c, "describe_item", share_id="share1", item_id="item1")) == "pass-cli item failed", got
+        assert (got := error(c, "list_vaults")) == "pass-cli vault failed", got
+        assert len(logins(d)) == 1, calls(d)
+    finally:
+        c.close()
+
+
+def test_get_totp_returns_only_the_digits_after_approval():
+    d, c = start()
+    op = Operator(d)
+    try:
+        assert (got := c.call("get_totp", share_id="share1", item_id="item1", reason="2fa")) == {"code": "123456"}, got
+        assert op.prompts == [{"action": "totp", "title": "Bank", "reason": "2fa"}], op.prompts
+        op.close()
+        before = len(calls(d))
+        assert (got := error(c, "get_totp", share_id="share1", item_id="item1", reason="2fa")) == "approval helper is not running", got
+        assert [a for a in calls(d)[before:] if a[:2] == ["item", "totp"]] == [], calls(d)
+        op = Operator(d, {"op": "allow-net"})
+        assert (got := error(c, "get_totp", share_id="share1", item_id="item1", reason="2fa")) == "release denied", got
+        op.close()
+        assert [a for a in calls(d)[before:] if a[:2] == ["item", "totp"]] == [], calls(d)
+    finally:
+        c.close()
+
+
+def test_pass_cli_gets_a_fresh_environment():
+    d, c = start()
+    try:
+        c.call("list_vaults")
+        seen = json.load(open(os.path.join(d, "login-env.json")))
+        assert seen == {"PATH": os.environ["PATH"], "PROTON_PASS_SESSION_DIR": session(d),
+                        "PROTON_PASS_AGENT_REASON": "proton-pass plugin",
+                        "PROTON_PASS_PERSONAL_ACCESS_TOKEN": TOKEN}, seen
+    finally:
+        c.close()
+
+
+def test_symlink_pat_is_refused_and_login_is_not_run():
+    d, c = start()
+    try:
+        real = os.path.join(d, "real-pat")
+        os.rename(os.path.join(d, "pat"), real)
+        os.symlink(real, os.path.join(d, "pat"))
+        assert (got := error(c, "list_vaults")) == "PAT file must not be a symlink", got
+        assert logins(d) == [], calls(d)
+    finally:
+        c.close()
+
+
+def test_pat_must_be_mode_0600():
+    for mode in (0o644, 0o400):
+        d, c = start()
+        try:
+            os.chmod(os.path.join(d, "pat"), mode)
+            assert (got := error(c, "list_vaults")) == "PAT file must be mode 0600", got
+            assert logins(d) == [], calls(d)
+        finally:
+            c.close()
+
+
+def test_symlink_session_dir_refuses_to_start():
+    d = install()
+    os.mkdir(os.path.join(d, "real-session"), 0o700)
+    os.symlink(os.path.join(d, "real-session"), session(d))
+    assert (got := startup(d)) == (1, "proton-pass: PROTON_PASS_SESSION_DIR must not be a symlink\n"), got
+
+
+def test_symlink_dot_session_refuses_to_start():
+    d = install()
+    os.mkdir(session(d), 0o700)
+    os.mkdir(os.path.join(d, "elsewhere"), 0o700)
+    os.symlink(os.path.join(d, "elsewhere"), os.path.join(session(d), ".session"))
+    assert (got := startup(d)) == (1, "proton-pass: PROTON_PASS_SESSION_DIR/.session must not be a symlink\n"), got
+
+
+def test_open_session_dir_we_own_becomes_0700():
+    d = install()
+    os.mkdir(session(d))
+    os.chmod(session(d), 0o777)
+    d, c = start(d)
+    try:
+        c.call("list_vaults")
+        assert stat.S_IMODE(os.stat(session(d)).st_mode) == 0o700
+    finally:
+        c.close()
+
+
+def test_startup_removes_leftover_run_dirs_without_following_symlinks():
+    d = install()
+    os.makedirs(os.path.join(session(d), "run-old", "nested"))
+    os.mkdir(os.path.join(d, "outside"))
+    write(d, "outside/keep", "keep")
+    os.symlink(os.path.join(d, "outside"), os.path.join(session(d), "run-link"))
+    d, c = start(d)
+    try:
+        assert sorted(os.listdir(session(d))) == ["run-link"], os.listdir(session(d))
+        assert open(os.path.join(d, "outside", "keep")).read() == "keep"
+    finally:
+        c.close()
+
+
+def test_leading_dash_ids_and_vaults_never_reach_pass_cli():
+    d, c = start()
+    try:
+        cases = (
+            ("describe_item", {"share_id": "--field", "item_id": "item1"}, "share_id is invalid"),
+            ("describe_item", {"share_id": "share1", "item_id": "-x"}, "item_id is invalid"),
+            ("describe_item", {"share_id": "share1", "item_id": "item1\n--field"}, "item_id is invalid"),
+            ("search_items", {"vault": "--help"}, "vault is invalid"),
+            ("search_items", {"vault": "V\nW"}, "vault is invalid"),
+            ("get_totp", {"share_id": "-s", "item_id": "item1", "reason": "r"}, "share_id is invalid"),
+            ("fill_login", {"share_id": "share1", "item_id": "-i", "reason": "r"}, "item_id is invalid"),
+            ("run_approved", {"argv": ["/bin/true"], "env": {"PW": "pass://share1/-item1/pin"}, "reason": "r"},
+             "env PW must be a pass://SHARE_ID/ITEM_ID/FIELD reference"),
+        )
+        for name, args, want in cases:
+            got = error(c, name, **args)
+            assert got == want, (name, args, got)
+        assert calls(d) == [], calls(d)
+    finally:
+        c.close()
+
+
+def start_helper(d):
+    master, slave = os.openpty()
+    p = subprocess.Popen([sys.executable, SERVER, "approve"], env=dict(os.environ, **server_env(d)),
+                         stdin=slave, stdout=slave, stderr=slave, start_new_session=True,
+                         preexec_fn=lambda: fcntl.ioctl(0, termios.TIOCSCTTY, 0))
+    os.close(slave)
+    return p, master
+
+
+def read_tty(master, marker):
+    buf = b""
+    while marker not in buf:
+        ready, _, _ = select.select([master], [], [], 15)
+        if not ready:
+            raise AssertionError(f"the tty never showed {marker!r}: {buf!r}")
+        buf += os.read(master, 4096)
+    return buf.decode().replace("\r\n", "\n")
+
+
+def result(msg):
+    text = msg["result"]["content"][0]["text"]
+    return text if msg["result"].get("isError") else json.loads(text)
+
+
+def test_approve_helper_shows_the_claim_on_the_tty():
+    d, c = start()
+    helper, tty = start_helper(d)
+    try:
+        read_tty(tty, b"listening")
+        argv, out = child(d)
+        reason = "deploy\x1b[2J\nnow"
+        c.send({"jsonrpc": "2.0", "id": 90, "method": "tools/call", "params": {
+            "name": "run_approved", "arguments": {"argv": argv, "env": {"PW": REF}, "reason": reason}}})
+        shown = read_tty(tty, b"denies.")
+        os.write(tty, b"approve\n")
+        assert result(c.read()) == {"exit_code": 7}
+        want = "\n".join([
+            "proton-pass release request",
+            "  action:  run",
+            "  argv:    " + repr(argv[0]),
+            *["           " + repr(a) for a in argv[1:]],
+            f"  env:     'PW' = {REF!r} from 'Bank'",
+            "  network: off (type approve-net to allow it)",
+            "  reason:  " + repr(reason),
+            "Type approve to release. Anything else denies.",
+        ])
+        assert want in shown, shown
+        assert "\x1b" not in shown, shown
+        c.send({"jsonrpc": "2.0", "id": 91, "method": "tools/call", "params": {
+            "name": "get_totp", "arguments": {"share_id": "share1", "item_id": "item1", "reason": "2fa"}}})
+        shown = read_tty(tty, b"denies.")
+        os.write(tty, b"approve-net\n")
+        assert result(c.read()) == "release denied"
+        want = ("proton-pass release request\n  action:  totp\n  item:    'Bank'\n  reason:  '2fa'\n"
+                "Type approve to release. Anything else denies.")
+        assert want in shown, shown
+        assert [a for a in calls(d) if a[:2] == ["item", "totp"]] == [], calls(d)
+    finally:
+        helper.terminate()
+        helper.wait()
+        os.close(tty)
+        c.close()
+
+
+def test_approve_helper_refuses_a_symlink_socket():
+    d = install()
+    os.mkdir(session(d), 0o700)
+    os.symlink(os.path.join(d, "elsewhere.sock"), os.path.join(session(d), "approve.sock"))
+    r = subprocess.run([sys.executable, SERVER, "approve"], env=dict(os.environ, **server_env(d)),
+                       stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30, start_new_session=True)
+    assert (r.returncode, r.stderr) == (1, "proton-pass: approve.sock must not be a symlink\n"), r
+    assert not os.path.exists(os.path.join(d, "elsewhere.sock"))
+
+
+def test_search_and_describe_return_metadata_only():
+    d, c = start()
     try:
         assert c.call("search_items", query="bank", limit=10) == {
             "count": 1,
@@ -90,186 +381,70 @@ def test_metadata_search_and_describe_hide_secrets():
         assert got == {
             "title": "Bank", "share_id": "share1", "item_id": "item1", "type": "Login",
             "urls": ["https://bank.com/login"], "username": "ada", "email": "ada@example.com",
-            "has_password": True, "has_totp": True, "extra_field_names": ["api"], "has_note": False,
+            "has_password": True, "has_totp": True, "extra_field_names": ["api"], "has_note": True,
         }, got
-        blob = json.dumps(got)
-        assert PASSWORD not in blob and SEED not in blob and TOKEN not in blob
-        assert c.call("get_totp", share_id="share1", item_id="item1") == {"code": "123456"}
-        assert c.call("get_secret", share_id="share1", item_id="item1", field="password")["value"] == PASSWORD
     finally:
         c.close()
 
 
 def test_non_auth_error_is_not_a_relogin():
-    d = tempfile.mkdtemp()
-    c = start(d)
+    d, c = start()
     try:
         c.call("list_vaults")
-        open(os.path.join(d, "not-a-login"), "w").close()
-        try:
-            c.call("describe_item", share_id="share1", item_id="item1")
-            raise AssertionError("describe should have failed")
-        except RuntimeError as e:
-            text = str(e)
-        assert "not a login" in text, text
-        assert TOKEN not in text, text
-        assert [line.split()[0] for line in calls(d)].count("login") == 1, calls(d)
+        write(d, "stderr", "Error: item is not a login")
+        assert (got := error(c, "describe_item", share_id="share1", item_id="item1")) == "pass-cli item failed", got
+        assert len(logins(d)) == 1, calls(d)
     finally:
         c.close()
 
 
 def test_login_failure_hides_the_token():
-    d = tempfile.mkdtemp()
-    c = start(d)
-    open(os.path.join(d, "login-fail"), "w").close()
-    try:
+    for token in (TOKEN, "xy"):
+        d, c = start(token=token)
+        write(d, "login-fail", "")
         try:
-            c.call("list_vaults")
-            raise AssertionError("login should have failed")
-        except RuntimeError as e:
-            text = str(e)
-        assert TOKEN not in text, text
-        assert "login failed" in text, text
-    finally:
-        c.close()
-
-
-def test_later_error_hides_token_and_loaded_password():
-    d = tempfile.mkdtemp()
-    c = start(d)
-    try:
-        described = c.call("describe_item", share_id="share1", item_id="item1")
-        assert PASSWORD not in json.dumps(described)
-        open(os.path.join(d, "fail-with-secrets"), "w").close()
-        try:
-            c.call("list_vaults")
-            raise AssertionError("expected pass-cli error")
-        except RuntimeError as e:
-            text = str(e)
-        assert TOKEN not in text, text
-        assert PASSWORD not in text, text
-        assert [line.split()[0] for line in calls(d)].count("login") == 1, calls(d)
-    finally:
-        c.close()
-
-
-def test_run_with_secrets_passes_refs_and_redacts_known_secrets():
-    d = tempfile.mkdtemp()
-    c = start(d)
-    try:
-        c.call("describe_item", share_id="share1", item_id="item1")
-        open(os.path.join(d, "echo-secrets"), "w").close()
-        got = c.call("run_with_secrets", command="printf done", env={"PW": "pass://share1/item1/password"}, reason="offline test")
-        blob = json.dumps(got)
-        assert TOKEN not in blob, blob
-        assert PASSWORD not in blob, blob
-        assert got["exit_code"] == 0
-        assert open(os.path.join(d, "env-pw")).read() == "pass://share1/item1/password"
-        assert sum(1 for line in calls(d) if line.startswith("run ")) == 1, calls(d)
-    finally:
-        c.close()
-
-
-def test_rejects_raw_env_values_and_bad_refs_before_run():
-    d = tempfile.mkdtemp()
-    c = start(d)
-    try:
-        for env in ({"PW": "literal-secret-value"}, {"PW": "pass://only-one"}, {"BAD-NAME": "pass://share1/item1/password"}):
-            before = len(calls(d))
-            try:
-                c.call("run_with_secrets", command="echo hi", env=env)
-                raise AssertionError(f"accepted {env}")
-            except RuntimeError as e:
-                text = str(e)
-            assert "literal-secret-value" not in text, text
-            assert TOKEN not in text
-            assert not any(line.startswith("run ") for line in calls(d)[before:]), calls(d)
-    finally:
-        c.close()
-
-
-def test_short_token_is_redacted_on_login_failure():
-    d = tempfile.mkdtemp()
-    c = start(d, token="xy")
-    open(os.path.join(d, "login-fail"), "w").close()
-    try:
-        try:
-            c.call("list_vaults")
-            raise AssertionError("login should have failed")
-        except RuntimeError as e:
-            text = str(e)
-        assert "xy" not in text, text
-        assert "login failed" in text, text
-    finally:
-        c.close()
-
-
-def test_world_readable_pat_is_refused():
-    d = tempfile.mkdtemp()
-    c = start(d, chmod_pat=0o644)
-    try:
-        try:
-            c.call("list_vaults")
-            raise AssertionError("world-readable PAT was accepted")
-        except RuntimeError as e:
-            text = str(e)
-        assert "0600" in text, text
-        assert TOKEN not in text, text
-        assert not any(line.startswith("login") for line in calls(d)), calls(d)
-        assert not os.path.exists(os.path.join(d, "seen-token"))
-    finally:
-        c.close()
+            assert (got := error(c, "list_vaults")) == "pass-cli login failed", got
+        finally:
+            c.close()
 
 
 def test_session_dir_is_private_and_tilde_expands():
-    d = tempfile.mkdtemp()
-    home = os.path.join(d, "home")
-    c = start(d, PROTON_PASS_SESSION_DIR="~/pass-session")
+    d, c = start(PROTON_PASS_SESSION_DIR="~/pass-session")
     try:
         c.call("list_vaults")
-        seen = open(os.path.join(d, "session")).read()
-        expect = os.path.join(home, "pass-session")
-        assert seen == expect, seen
-        assert not seen.startswith("/tmp/pass-agent-mcp")
-        mode = stat.S_IMODE(os.stat(seen).st_mode)
-        assert mode == 0o700, oct(mode)
+        seen = json.load(open(os.path.join(d, "login-env.json")))["PROTON_PASS_SESSION_DIR"]
+        assert seen == os.path.join(d, "home", "pass-session"), seen
+        assert stat.S_IMODE(os.stat(seen).st_mode) == 0o700
     finally:
         c.close()
 
 
 def test_default_session_dir_is_under_home():
-    d = tempfile.mkdtemp()
-    home = os.path.join(d, "home")
-    c = start(d, drop=("PROTON_PASS_SESSION_DIR",))
+    d, c = start(drop=("PROTON_PASS_SESSION_DIR",))
     try:
         c.call("list_vaults")
-        seen = open(os.path.join(d, "session")).read()
-        assert seen == os.path.join(home, ".local", "share", "pass-agent"), seen
-        mode = stat.S_IMODE(os.stat(seen).st_mode)
-        assert mode == 0o700, oct(mode)
+        seen = json.load(open(os.path.join(d, "login-env.json")))["PROTON_PASS_SESSION_DIR"]
+        assert seen == os.path.join(d, "home", ".local", "share", "pass-agent"), seen
+        assert stat.S_IMODE(os.stat(seen).st_mode) == 0o700
     finally:
         c.close()
 
 
 def test_parse_error_and_bad_request_do_not_kill_the_server():
-    d = tempfile.mkdtemp()
-    c = start(d)
+    d, c = start()
     try:
         c.send_raw("{")
         msg = c.read()
-        assert msg["error"]["code"] == -32700, msg
-        assert TOKEN not in json.dumps(msg)
+        assert msg == {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}}, msg
         c.send_raw(json.dumps({"jsonrpc": "2.0", "id": 50, "method": "tools/call"}))
-        msg = c.read()
-        assert msg["error"]["code"] == -32602, msg
+        assert c.read()["error"]["code"] == -32602
         assert c.call("list_vaults")[0]["name"] == "V"
     finally:
         c.close()
 
 
 def test_notification_does_not_run_a_tool():
-    d = tempfile.mkdtemp()
-    c = start(d)
+    d, c = start()
     try:
         c.send({"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "list_vaults", "arguments": {}}})
         assert c.rpc("ping") == {}
@@ -279,84 +454,51 @@ def test_notification_does_not_run_a_tool():
 
 
 def test_unsupported_protocol_version_is_not_echoed():
-    d = tempfile.mkdtemp()
-    c = start(d)
+    d, c = start()
     try:
         c.send({"jsonrpc": "2.0", "id": 40, "method": "initialize",
                 "params": {"protocolVersion": "1999-01-01", "capabilities": {}, "clientInfo": {"name": "t"}}})
-        msg = c.read()
-        assert msg["result"]["protocolVersion"] == "2025-06-18", msg
+        assert c.read()["result"]["protocolVersion"] == "2025-06-18"
     finally:
         c.close()
 
 
 def test_invalid_tool_arguments():
-    d = tempfile.mkdtemp()
-    c = start(d)
+    d, c = start()
     try:
         cases = (
-            ("describe_item", {"share_id": "share1"}, "item_id"),
-            ("describe_item", {"share_id": "--field", "item_id": "item1"}, "share_id"),
-            ("search_items", {"query": "bank", "limit": -1}, "limit"),
-            ("search_items", {"query": "bank", "type": "password"}, "type"),
-            ("list_vaults", {"nope": True}, "unknown"),
+            ("describe_item", {"share_id": "share1"}, "missing item_id"),
+            ("search_items", {"query": "bank", "limit": -1}, "limit must be >= 0"),
+            ("search_items", {"query": "bank", "type": "password"}, "type must be one of: login, note, alias, "
+                                                                     "credit-card, identity, ssh-key, wifi, custom"),
+            ("list_vaults", {"nope": True}, "unknown argument nope"),
+            ("fill_login", {"share_id": "share1", "item_id": "item1", "reason": "r", "submit": "yes"},
+             "submit must be a boolean"),
+            ("run_approved", {"argv": "/bin/true", "env": {"PW": REF}, "reason": "r"}, "argv must be an array of strings"),
+            ("no_such_tool", {}, "unknown tool no_such_tool"),
         )
-        for name, kwargs, needle in cases:
-            before = calls(d)
-            try:
-                c.call(name, **kwargs)
-                raise AssertionError(f"accepted {kwargs}")
-            except RuntimeError as e:
-                text = str(e)
-            assert needle in text, (kwargs, text)
-            assert calls(d) == before, calls(d)
-        try:
-            c.call("no_such_tool")
-            raise AssertionError("unknown tool was accepted")
-        except RuntimeError as e:
-            assert "unknown tool" in str(e), e
+        for name, args, want in cases:
+            got = error(c, name, **args)
+            assert got == want, (name, args, got)
+        assert calls(d) == [], calls(d)
         assert c.call("list_vaults")[0]["name"] == "V"
     finally:
         c.close()
 
 
 def test_invalid_item_json_does_not_echo_the_body():
-    d = tempfile.mkdtemp()
-    c = start(d)
+    d, c = start()
     try:
-        open(os.path.join(d, "bad-json"), "w").close()
-        try:
-            c.call("describe_item", share_id="share1", item_id="item1")
-            raise AssertionError("invalid JSON was accepted")
-        except RuntimeError as e:
-            text = str(e)
-        assert PASSWORD not in text, text
-        assert "invalid JSON" in text, text
+        write(d, "item.json", f"NOT JSON {PASSWORD}")
+        assert (got := error(c, "describe_item", share_id="share1", item_id="item1")) == "pass-cli returned invalid JSON", got
     finally:
         c.close()
 
 
-TESTS = [
-    test_metadata_search_and_describe_hide_secrets,
-    test_non_auth_error_is_not_a_relogin,
-    test_login_failure_hides_the_token,
-    test_short_token_is_redacted_on_login_failure,
-    test_later_error_hides_token_and_loaded_password,
-    test_run_with_secrets_passes_refs_and_redacts_known_secrets,
-    test_rejects_raw_env_values_and_bad_refs_before_run,
-    test_world_readable_pat_is_refused,
-    test_session_dir_is_private_and_tilde_expands,
-    test_default_session_dir_is_under_home,
-    test_parse_error_and_bad_request_do_not_kill_the_server,
-    test_notification_does_not_run_a_tool,
-    test_unsupported_protocol_version_is_not_echoed,
-    test_invalid_tool_arguments,
-    test_invalid_item_json_does_not_echo_the_body,
-]
-
 if __name__ == "__main__":
+    tests = [f for name, f in list(globals().items()) if name.startswith("test_")]
     failed = 0
-    for test in TESTS:
+    for test in tests:
         try:
             test()
         except Exception as e:
@@ -365,5 +507,5 @@ if __name__ == "__main__":
         else:
             print(f"OK   {test.__name__}")
     if failed:
-        raise SystemExit(f"{failed} failed")
-    print(f"{len(TESTS)} offline tests OK")
+        raise SystemExit(f"{failed} of {len(tests)} offline tests failed")
+    print(f"{len(tests)} offline tests OK")
