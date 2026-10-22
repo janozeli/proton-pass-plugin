@@ -36,15 +36,28 @@ if args == ["login"]:
     finish()
 if not os.path.exists(path("ok")):
     finish(err="Error: This operation requires an authenticated client", code=1)
+if args[:1] == ["info"]:
+    try:
+        os.remove(path("ok"))
+    except FileNotFoundError:
+        pass
+    finish(err="session invalidated", code=1)
 if os.path.exists(path("stderr")):
     finish(err=open(path("stderr")).read(), code=1)
+if args[:3] == ["item", "create", "login"]:
+    open(path("created.json"), "w").write(sys.stdin.read())
+    finish("item-new\n")
+if args[:2] == ["item", "delete"]:
+    open(path("deleted"), "a").write(json.dumps(args) + "\n")
+    finish()
 if args[:2] == ["run", "--"]:
     json.dump(env, open(path("run-env.json"), "w"))
     json.dump([os.readlink(f"/proc/self/fd/{n}") for n in range(3)], open(path("run-fds.json"), "w"))
     secrets = json.load(open(path("secrets.json")))
     child = {k: secrets[v[len("pass://"):]] if v.startswith("pass://") else v for k, v in env.items()}
     os.execve(args[2], args[2:], child)
-replies = {"vault list": "vaults.json", "item list": "items.json", "item view": "item.json", "item totp": "totp.json"}
+replies = {"vault list": "vaults.json", "item list": "items.json", "item view": "item.json",
+           "item totp": "totp.json", "share list": "shares.json"}
 name = replies.get(" ".join(args[:2]))
 if not name:
     finish(err="unexpected " + " ".join(args), code=1)
@@ -103,6 +116,7 @@ def install(d=None, urls=("https://bank.com/login",), token=TOKEN):
     write(d, "pat", token + "\n")
     os.chmod(os.path.join(d, "pat"), 0o600)
     write(d, "vaults.json", {"vaults": [{"name": "V", "vault_id": "v", "share_id": "share1"}]})
+    write(d, "shares.json", {"shares": [{"id": "share1", "name": "V", "share_type": "Vault", "share_role": "Viewer"}]})
     write(d, "items.json", {"items": [
         {"title": "Bank", "item_type": "login", "share_id": "share1", "id": "item1", "modify_time": 1, "state": "Active"},
         {"title": "Old", "item_type": "login", "share_id": "share1", "id": "item2", "modify_time": 1, "state": "Trashed"},

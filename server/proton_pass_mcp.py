@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-import ipaddress, http.client, json, os, re, resource, shutil, signal, select, socket, stat, struct, subprocess, sys, termios, time, unicodedata
+import ipaddress, json, math, os, re, resource, secrets, shutil, signal, select, socket, stat, struct, subprocess, sys, termios, time, unicodedata
+from datetime import datetime, timezone
 from urllib.parse import urlsplit
 import idna
+from cdp_discover import DiscoverError, discover_cdp
+from totp_gen import TotpError, normalize_totp, totp_code
 
 PASS_CLI = os.path.expanduser(os.environ.get("PASS_CLI", "~/.local/bin/pass-cli"))
 PAT_FILE = os.path.expanduser(os.environ.get("PASS_PAT_FILE", "~/.config/pass-agent/pat"))
@@ -12,7 +15,7 @@ REF = re.compile(r"pass://([^/?#%]+)/([^/?#%]+)/([^/?#%]+)")
 PROTOCOL = "2025-06-18"
 SUPPORTED = {"2024-11-05", "2025-03-26", PROTOCOL}
 FORBIDDEN = {"get_secret", "run_with_secrets", "command", "url_match", "url", "username_selector",
-             "password_selector", "cdp_port", "cwd", "value", "password", "totp_uri"}
+             "password_selector", "cdp_port", "cwd", "value", "totp_uri"}
 RESERVED_ENV = {"PATH", "HOME", "LD_PRELOAD", "LD_LIBRARY_PATH", "PROTON_PASS_SESSION_DIR", "PROTON_PASS_AGENT_REASON",
                 "PROTON_PASS_PERSONAL_ACCESS_TOKEN", "PASS_PAT_FILE", "PASS_CLI"}
 # pass-cli puts the resolved secrets in the environment it hands to bwrap, so the sandbox unsets
@@ -113,10 +116,14 @@ def login():
         raise PassError("pass-cli login failed")
 
 
-def cli(*args, reason=REASON, relogin=True):
+def cli(*args, reason=REASON, relogin=True, stdin_text=None):
     try:
-        r = subprocess.run([PASS_CLI, *args], env=cli_env(reason), stdin=subprocess.DEVNULL, capture_output=True,
-                           encoding="utf-8", errors="replace", timeout=120)
+        kw = {"env": cli_env(reason), "capture_output": True, "encoding": "utf-8", "errors": "replace", "timeout": 120}
+        if stdin_text is None:
+            kw["stdin"] = subprocess.DEVNULL
+        else:
+            kw["input"] = stdin_text
+        r = subprocess.run([PASS_CLI, *args], **kw)
     except subprocess.TimeoutExpired:
         raise PassError(f"pass-cli {args[0]} timed out")
     except OSError:
@@ -124,7 +131,7 @@ def cli(*args, reason=REASON, relogin=True):
     if r.returncode != 0:
         if relogin and AUTH_ERR.search(r.stderr):
             login()
-            return cli(*args, reason=reason, relogin=False)
+            return cli(*args, reason=reason, relogin=False, stdin_text=stdin_text)
         raise PassError(f"pass-cli {args[0]} failed")
     return r.stdout
 
@@ -217,7 +224,7 @@ def release(prompt):
 
 
 def render(p):
-    if p["action"] not in ("fill", "totp", "run"):
+    if p["action"] not in ("fill", "totp", "run", "write"):
         raise ValueError("unknown action")
     lines = ["proton-pass release request", f"  action:  {p['action']}"]
     if p["action"] == "run":
@@ -230,6 +237,8 @@ def render(p):
         lines.append(f"  item:    {p['title']!r}")
     if p["action"] == "fill":
         lines += [f"  origin:  {p['origin']!r}", f"  submit:  {p['submit']!r}"]
+    if p["action"] == "write":
+        lines.append(f"  change:  {p['change']!r}")
     lines += [f"  reason:  {shown(p['reason'], REASON_LIMIT)}", "Type approve to release. Anything else denies."]
     return "\n".join(lines)
 
@@ -426,25 +435,11 @@ FILL = """function(arg, ...closedRoots) {
   return filled;
 }"""
 
-def cdp_endpoint():
+def cdp_endpoint(origins):
     try:
-        port = int(os.environ.get("PASS_CDP_PORT", "9222"))
-    except ValueError:
-        raise PassError("PASS_CDP_PORT is invalid")
-    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-    try:
-        conn.request("GET", "/json/version")
-        ws = urlsplit(json.loads(conn.getresponse().read())["webSocketDebuggerUrl"])
-    except (OSError, ValueError, KeyError, TypeError, http.client.HTTPException):
-        raise PassError(f"no browser is listening on CDP port {port}")
-    finally:
-        conn.close()
-    if ws.hostname != "127.0.0.1":
-        raise PassError("the browser's CDP address is not 127.0.0.1")
-    browser_id = ws.path.removeprefix("/devtools/browser/")
-    if not re.fullmatch(r"[A-Za-z0-9-]+", browser_id):
-        raise PassError("the browser's CDP address is invalid")
-    return f"ws://127.0.0.1:{port}/devtools/browser/{browser_id}"
+        return discover_cdp(os.environ.get("PASS_CDP_PORT"), origins, browser_origin)
+    except DiscoverError as exc:
+        raise PassError(str(exc))
 
 
 def fill_login(a):
@@ -462,7 +457,7 @@ def fill_login(a):
     if not origins:
         raise PassError("item has no website to fill")
     submit = a.get("submit", False)
-    endpoint = cdp_endpoint()
+    endpoint = cdp_endpoint(origins)
     with sync_playwright() as p:
         browser = p.chromium.connect_over_cdp(endpoint)
         try:
@@ -482,9 +477,15 @@ def fill_login(a):
             filled = [f for f in ("username", "password") if isinstance(got, list) and f in got]
             if not filled:
                 raise PassError("no password field on the matching tab")
+            totp = maybe_fill_totp(page, allowed, lg.get("totp_uri")) if a.get("auto_2fa", True) else None
         finally:
             browser.close()
-    return {"filled": filled, "submitted": submit}
+    result = {"filled": filled, "submitted": False}
+    if totp:
+        result["filled"] = filled + ["totp"]
+        result["totp"] = totp["code"]
+        result["totp_submitted"] = totp["submitted"]
+    return result
 
 
 def isolated_fill(page, arg):
@@ -532,6 +533,146 @@ def isolated_fill(page, arg):
             session.send("Runtime.releaseObjectGroup", {"objectGroup": "proton-pass-fill"})
         finally:
             session.detach()
+
+
+OTP_DETECT = r"""function(arg) {
+  if (location.origin !== arg.origin) return {found: false};
+  const shadow = el => el.shadowRoot;
+  const eligible = el => {
+    const box = el.getBoundingClientRect();
+    return el.isConnected && el.ownerDocument === document && !el.matches(':disabled') &&
+      !el.readOnly && box.width > 0 && box.height > 0 &&
+      el.checkVisibility({visibilityProperty: true, opacityProperty: true});
+  };
+  const inputs = () => {
+    const found = [];
+    const walk = root => {
+      for (const el of root.querySelectorAll('*')) {
+        if (el instanceof HTMLInputElement) found.push(el);
+        const nested = shadow(el);
+        if (nested) walk(nested);
+      }
+    };
+    walk(document);
+    return found;
+  };
+  const all = inputs();
+  const otpLike = el => {
+    if (el.type === 'password' || el.type === 'hidden' || !eligible(el)) return false;
+    if ((el.getAttribute('autocomplete') || '').toLowerCase() === 'one-time-code') return true;
+    const label = ((el.name || '') + ' ' + (el.id || '') + ' ' + (el.getAttribute('aria-label') || '')).toLowerCase();
+    const named = /otp|totp|\b2fa\b|mfa|one-time|verification/.test(label);
+    const max = el.maxLength;
+    return named && ((max >= 6 && max <= 8) || el.inputMode === 'numeric');
+  };
+  const shares = (form) => !!(form && all.some(el => el.form === form && el.type === 'password'));
+  const single = all.filter(otpLike);
+  if (single.length === 1) return {found: true, split: false, sharesPassword: shares(single[0].form)};
+  const boxes = all.filter(el => el.maxLength === 1 && el.inputMode === 'numeric' && el.type !== 'password' && eligible(el));
+  if (boxes.length >= 6 && boxes.length <= 8 && boxes.every(el => el.form && el.form === boxes[0].form))
+    return {found: true, split: true, sharesPassword: shares(boxes[0].form)};
+  return {found: false};
+}"""
+
+OTP_FILL = r"""function(arg) {
+  if (location.origin !== arg.origin || typeof arg.code !== 'string') return {filled: false, submitted: false};
+  const shadow = el => el.shadowRoot;
+  const eligible = el => {
+    const box = el.getBoundingClientRect();
+    return el.isConnected && el.ownerDocument === document && !el.matches(':disabled') &&
+      !el.readOnly && box.width > 0 && box.height > 0 &&
+      el.checkVisibility({visibilityProperty: true, opacityProperty: true});
+  };
+  const inputs = () => {
+    const found = [];
+    const walk = root => {
+      for (const el of root.querySelectorAll('*')) {
+        if (el instanceof HTMLInputElement) found.push(el);
+        const nested = shadow(el);
+        if (nested) walk(nested);
+      }
+    };
+    walk(document);
+    return found;
+  };
+  const all = inputs();
+  const otpLike = el => {
+    if (el.type === 'password' || el.type === 'hidden' || !eligible(el)) return false;
+    if ((el.getAttribute('autocomplete') || '').toLowerCase() === 'one-time-code') return true;
+    const label = ((el.name || '') + ' ' + (el.id || '') + ' ' + (el.getAttribute('aria-label') || '')).toLowerCase();
+    const named = /otp|totp|\b2fa\b|mfa|one-time|verification/.test(label);
+    const max = el.maxLength;
+    return named && ((max >= 6 && max <= 8) || el.inputMode === 'numeric');
+  };
+  const targets = arg.split
+    ? all.filter(el => el.maxLength === 1 && el.inputMode === 'numeric' && el.type !== 'password' && eligible(el))
+    : all.filter(otpLike);
+  const values = arg.split ? [...arg.code] : [arg.code];
+  if (targets.length !== values.length) return {filled: false, submitted: false};
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+  const set = (el, value) => {
+    el.focus({preventScroll: true});
+    setter.call(el, value);
+    el.dispatchEvent(new Event('input', {bubbles: true}));
+    el.dispatchEvent(new Event('change', {bubbles: true}));
+    return el.value === value;
+  };
+  if (!targets.every((el, index) => set(el, values[index]))) return {filled: false, submitted: false};
+  const form = targets[0].form;
+  const shares = !!(form && all.some(el => el.form === form && el.type === 'password'));
+  let submitted = false;
+  if (arg.submit && form && !shares) {
+    try { form.requestSubmit(); submitted = true; } catch (e) {}
+  }
+  return {filled: true, submitted};
+}"""
+
+
+def isolated_call(page, function, arg):
+    session = page.context.new_cdp_session(page)
+    try:
+        frame = session.send("Page.getFrameTree")["frameTree"]["frame"]["id"]
+        world = session.send("Page.createIsolatedWorld", {"frameId": frame, "worldName": "proton-pass-otp"})
+        result = session.send("Runtime.callFunctionOn", {
+            "functionDeclaration": function,
+            "executionContextId": world["executionContextId"],
+            "arguments": [{"value": arg}],
+            "returnByValue": True,
+        })
+        if result.get("exceptionDetails") is not None:
+            raise PassError("internal error")
+        return result["result"].get("value")
+    except PassError:
+        raise
+    except (OSError, KeyError, TypeError):
+        raise PassError("internal error")
+    finally:
+        session.detach()
+
+
+def maybe_fill_totp(page, origin, uri):
+    if not uri:
+        return None
+    try:
+        found = isolated_call(page, OTP_DETECT, {"origin": origin})
+    except PassError:
+        return None
+    if not isinstance(found, dict) or not found.get("found"):
+        return None
+    try:
+        code = totp_code(uri)
+    except TotpError:
+        raise PassError("the password is filled, but the item has no usable TOTP secret")
+    try:
+        wrote = isolated_call(page, OTP_FILL, {
+            "origin": origin, "code": code, "submit": not found.get("sharesPassword"),
+            "split": bool(found.get("split")),
+        })
+    except PassError:
+        raise PassError("the password is filled, but the TOTP field could not be filled")
+    if not isinstance(wrote, dict) or not wrote.get("filled"):
+        return None
+    return {"code": code, "submitted": bool(wrote.get("submitted"))}
 
 
 def ref_parts(ref):
@@ -648,18 +789,233 @@ def validate(name, args):
                 raise PassError(f"env {k} must be a pass://SHARE_ID/ITEM_ID/FIELD reference")
 
 
+READ_ONLY = ("this agent token can read and fill items, but creating or editing needs write access "
+             "(Editor, Manager, or Owner) on that vault. Reading and filling still work. "
+             "Ask the user to grant write access.")
+WRITE_ROLES = {"owner", "manager", "editor"}
+
+
+def clean_text(value, label):
+    if not isinstance(value, str) or not value.strip() or any(ord(c) < 32 for c in value) or len(value) > 300:
+        raise PassError(f"{label} is invalid")
+    return value.strip()
+
+
+def meta_file():
+    return PAT_FILE + ".meta"
+
+
+def renew_command():
+    return f"python3 {os.path.abspath(__file__)} setup --renew"
+
+
+def read_public_meta():
+    path = meta_file()
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return {}
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        return {}
+    try:
+        with open(os.open(path, os.O_RDONLY | os.O_NOFOLLOW)) as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    kept = {}
+    for key in ("name", "expires_at", "expiration", "vaults", "role"):
+        if key in data:
+            kept[key] = data[key]
+    if not isinstance(kept.get("expires_at"), int) or isinstance(kept.get("expires_at"), bool):
+        kept.pop("expires_at", None)
+    if not isinstance(kept.get("name"), str):
+        kept.pop("name", None)
+    return kept
+
+
+def access_of(role):
+    if isinstance(role, str) and role.strip().lower() in WRITE_ROLES:
+        return "write", role.strip()
+    if isinstance(role, str) and role.strip():
+        return "read", role.strip()
+    return "read", "unknown"
+
+
+def share_rows():
+    return cli_json("share", "list", "--only-vaults=true")["shares"]
+
+
+def resolve_share(a):
+    share_id, vault = a.get("share_id"), a.get("vault")
+    if bool(share_id) == bool(vault):
+        raise PassError("pass share_id or vault, not both" if share_id else "pass share_id or vault")
+    if share_id:
+        return share_id
+    for row in list_vaults({}):
+        if row.get("name") == vault:
+            return row["share_id"]
+    raise PassError("vault was not found")
+
+
+def require_write(share_id):
+    role = None
+    for row in share_rows():
+        if row.get("id") == share_id or row.get("share_id") == share_id:
+            role = row.get("share_role")
+            break
+    if access_of(role)[0] != "write":
+        raise PassError(READ_ONLY)
+
+
+def optional_totp(a):
+    uri, seed = a.get("otpauth_uri"), a.get("seed")
+    if uri and seed:
+        raise PassError("pass otpauth_uri or seed, not both")
+    if not uri and not seed:
+        return None
+    if (uri and (len(uri) > 2048 or any(ord(c) < 32 for c in uri))) or (seed and len(seed) > 256):
+        raise PassError("TOTP secret is invalid")
+    try:
+        return normalize_totp(uri, seed)
+    except TotpError as exc:
+        raise PassError(str(exc))
+
+
+def generated_password():
+    alphabet = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    chars = [secrets.choice(alphabet) for _ in range(19)]
+    chars.append(secrets.choice("!@#$%?"))
+    secrets.SystemRandom().shuffle(chars)
+    return "".join(chars)
+
+
+def item_id_from(stdout, *hidden):
+    line = stdout.strip().splitlines()[0].strip() if stdout.strip() else ""
+    if any(secret and secret in line for secret in hidden):
+        raise PassError("pass-cli item failed")
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", line):
+        raise PassError("pass-cli item failed")
+    return line
+
+
+def session_info(a):
+    shares = {row.get("id") or row.get("share_id"): row.get("share_role") for row in share_rows()}
+    vaults = []
+    for row in list_vaults({}):
+        access, label = access_of(shares.get(row.get("share_id")))
+        vaults.append({"name": row.get("name"), "vault_id": row.get("vault_id"), "share_id": row.get("share_id"),
+                       "role": label, "access": access})
+    meta = read_public_meta()
+    expires = meta.get("expires_at")
+    days = math.floor((expires - time.time()) / 86400) if expires is not None else None
+    warning = None
+    renew = renew_command()
+    if days is not None and days < 14:
+        if days < 0:
+            warning = f"agent token has expired. Renew it with browser approval: {renew}"
+        else:
+            warning = f"agent token expires in {days} days. Renew it with browser approval: {renew}"
+    return {
+        "identity_type": "agent_token",
+        "name": meta.get("name"),
+        "vaults": vaults,
+        "can_write": any(row["access"] == "write" for row in vaults),
+        "expires_at": datetime.fromtimestamp(expires, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if expires is not None else None,
+        "expires_at_unix": expires,
+        "days_remaining": days,
+        "expiration_warning": days is not None and days < 14,
+        "warning": warning,
+        "renew_command": renew,
+    }
+
+
+def create_login(a):
+    title = clean_text(a.get("title"), "title")
+    username, email, urls = a.get("username") or "", a.get("email") or "", a.get("urls") or []
+    for label, value in (("username", username), ("email", email)):
+        if value and (any(ord(c) < 32 for c in value) or len(value) > 300):
+            raise PassError(f"{label} is invalid")
+    if len(urls) > 20 or any(any(ord(c) < 32 for c in url) or len(url) > 2048 for url in urls):
+        raise PassError("urls are invalid")
+    password, generate = a.get("password"), a.get("generate_password", False)
+    if generate and password is not None:
+        raise PassError("pass password or generate_password, not both")
+    if generate:
+        password = generated_password()
+    elif not isinstance(password, str) or not password or any(ord(c) < 32 for c in password) or len(password) > 1024:
+        raise PassError("pass password or generate_password")
+    totp_uri = optional_totp(a)
+    share_id = resolve_share(a)
+    require_write(share_id)
+    release({"action": "write", "title": title, "change": "create login", "reason": a["reason"]})
+    template = {"title": title, "password": password, "urls": list(urls)}
+    if username:
+        template["username"] = username
+    if email:
+        template["email"] = email
+    if totp_uri:
+        template["totp_uri"] = totp_uri
+    stdout = cli("item", "create", "login", "--share-id", share_id, "--from-template", "-",
+                  reason=a["reason"], stdin_text=json.dumps(template))
+    return {"item_id": item_id_from(stdout, password, totp_uri or "", a.get("seed") or "")}
+
+
+def save_totp(a):
+    uri = optional_totp(a)
+    if not uri:
+        raise PassError("pass otpauth_uri or seed")
+    require_write(a["share_id"])
+    item = view_item(a)
+    content = item.get("content") or {}
+    login = login_content(item)
+    if not isinstance(login, dict) or not login.get("password"):
+        raise PassError("item is not a login with a password")
+    if (content.get("note") or "").strip() or content.get("extra_fields") or login.get("passkeys"):
+        raise PassError("pass-cli cannot edit a login TOTP in place. Recreating this item would drop its note, "
+                        "extra fields, or passkeys. Add the TOTP in the Proton Pass app, or create a new login with create_login.")
+    title = content.get("title") or "login"
+    release({"action": "write", "title": title, "change": "attach TOTP by replacing the login", "reason": a["reason"]})
+    template = {"title": title, "password": login["password"], "urls": list(login.get("urls") or []), "totp_uri": uri}
+    if login.get("username"):
+        template["username"] = login["username"]
+    if login.get("email"):
+        template["email"] = login["email"]
+    stdout = cli("item", "create", "login", "--share-id", a["share_id"], "--from-template", "-",
+                  reason=a["reason"], stdin_text=json.dumps(template))
+    new_id = item_id_from(stdout, login["password"], uri, a.get("seed") or "", a.get("otpauth_uri") or "")
+    try:
+        cli("item", "delete", "--share-id", a["share_id"], "--item-id", a["item_id"], reason=a["reason"])
+    except PassError:
+        raise PassError(f"created item {new_id} with TOTP but could not delete {a['item_id']}")
+    return {"item_id": new_id, "replaced_item_id": a["item_id"]}
+
+
 S = {"type": "string"}
 WHY = {"type": "string", "description": "Why access is needed. Shown to the operator and stored in Proton's audit log."}
 ITEM = {"share_id": S, "item_id": S, "reason": WHY}
+PREFER = ("Use this MCP server instead of running pass-cli yourself. "
+          "Call session_info first if you are unsure which vaults this agent can access. "
+          "Never run pass-cli info; it can log out the agent session. ")
+CODE = (" A generated TOTP code expires in about 30 seconds and is not a secret, so it may be shown. "
+        "The TOTP seed, passwords, notes, and the agent token are secrets and are never returned.")
 TOOLS = {
-    "list_vaults": (list_vaults, "List Proton Pass vaults (names and ids).", {}, []),
-    "search_items": (search_items, "Search items by title (case-insensitive substring). Metadata only, no secrets.",
+    "list_vaults": (list_vaults, PREFER + "List Proton Pass vaults (names and ids). Metadata only.", {}, []),
+    "search_items": (search_items, PREFER + "Search items by title (case-insensitive substring). Metadata only, no secrets.",
                      {"query": S, "vault": S, "type": {"type": "string", "enum": ["login", "note", "alias", "credit-card", "identity", "ssh-key", "wifi", "custom"]}, "limit": {"type": "integer"}}, []),
-    "describe_item": (describe_item, "Item metadata: website origins (scheme, host, and port only), username, email, has_password, has_totp, extra field names. No path, query, fragment, or secret values.", ITEM, ["share_id", "item_id"]),
-    "get_totp": (get_totp, "Current TOTP code from the item's totp field, after the operator approves in the approval terminal. Returns only the digits.", ITEM, ["share_id", "item_id", "reason"]),
-    "fill_login": (fill_login, "After the operator approves, type the item's username and password into the one open Chrome tab whose origin equals one of the item's saved websites. The password never comes back. Automatic submission is refused: omit submit or set it to false, then submit manually. submitted is always false.",
-                   {**ITEM, "submit": {"type": "boolean"}}, ["share_id", "item_id", "reason"]),
-    "run_approved": (run_approved, "After the operator approves this exact argv, run it in a bubblewrap sandbox with pass://SHARE_ID/ITEM_ID/FIELD references injected as environment variables. The sandbox sees /usr, /bin, and /lib read-only, /etc name-service and TLS files, and an empty /tmp. It has no network unless the operator allows it. Output is discarded. Returns only the exit code.",
+    "describe_item": (describe_item, PREFER + "Item metadata: website origins (scheme, host, and port only), username, email, has_password, has_totp, extra field names. No path, query, fragment, or secret values.", ITEM, ["share_id", "item_id"]),
+    "session_info": (session_info, PREFER + "Read-only session report: agent-token identity, agent name, each vault's Proton role and read or write access, and the agent token expiration recorded by setup. Warns when fewer than 14 days remain and includes the renew command. Does not call pass-cli info.", {}, []),
+    "get_totp": (get_totp, PREFER + "Current TOTP code from the item's totp field, after the operator approves in the approval terminal. Returns only the digits." + CODE, ITEM, ["share_id", "item_id", "reason"]),
+    "fill_login": (fill_login, PREFER + "After the operator approves, type the item's username and password into the one open Chrome tab whose origin equals one of the item's saved websites. PASS_CDP_PORT selects the browser; otherwise the loopback Chrome whose open page matches the item is used, and several unmatched browsers are an error. The password never comes back. When auto_2fa is true (the default) and the page shows a TOTP field, the current code is typed too; a separate 2FA form is submitted, and the password form is not. Set auto_2fa to false to skip that. Automatic password submission is refused: omit submit or set it to false. submitted is always false." + CODE,
+                   {**ITEM, "submit": {"type": "boolean"}, "auto_2fa": {"type": "boolean", "description": "Type the current TOTP code when the page asks for one. Defaults to true."}}, ["share_id", "item_id", "reason"]),
+    "create_login": (create_login, PREFER + "Create a login in one vault after the operator approves. Pass share_id or vault, plus title, and either password or generate_password. Optional username, email, urls, and otpauth_uri or seed. The password and any TOTP seed are stored and never returned. A read-only agent token returns an error that reading and filling still work.",
+                     {"share_id": S, "vault": S, "title": S, "username": S, "email": S, "password": S,
+                      "generate_password": {"type": "boolean"}, "urls": {"type": "array", "items": S},
+                      "otpauth_uri": S, "seed": S, "reason": WHY}, ["title", "reason"]),
+    "save_totp": (save_totp, PREFER + "Attach or replace the TOTP on a plain login after the operator approves. Pass otpauth_uri or a base32 seed. pass-cli item update cannot edit a login TOTP, so a login with no note, extra fields, or passkeys is recreated and the previous item is deleted. The seed and password are never returned. A read-only agent token returns an error that reading and filling still work." + CODE,
+                  {"share_id": S, "item_id": S, "otpauth_uri": S, "seed": S, "reason": WHY}, ["share_id", "item_id", "reason"]),
+    "run_approved": (run_approved, PREFER + "After the operator approves this exact argv, run it in a bubblewrap sandbox with pass://SHARE_ID/ITEM_ID/FIELD references injected as environment variables. The sandbox sees /usr, /bin, and /lib read-only, /etc name-service and TLS files, and an empty /tmp. It has no network unless the operator allows it. Output is discarded. Returns only the exit code.",
                      {"argv": {"type": "array", "items": S, "description": "Absolute path of the program, then its arguments. No shell is added."},
                       "env": {"type": "object", "additionalProperties": S, "description": "Variable name to pass://SHARE_ID/ITEM_ID/FIELD reference."},
                       "reason": WHY}, ["argv", "env", "reason"]),
@@ -695,7 +1051,7 @@ def handle(msg):
         if version not in SUPPORTED:
             version = PROTOCOL
         return _result(mid, {"protocolVersion": version, "capabilities": {"tools": {}},
-                             "serverInfo": {"name": "proton-pass", "version": "0.2.0"}})
+                             "serverInfo": {"name": "proton-pass", "version": "0.3.0"}})
     if method == "tools/list":
         tools = [{"name": n, "description": d, "inputSchema": {"type": "object", "properties": p, "required": r, "additionalProperties": False}}
                  for n, (_, d, p, r) in TOOLS.items()]
@@ -725,6 +1081,9 @@ def write(obj):
 def main():
     global SESSION
     try:
+        if len(sys.argv) > 1 and sys.argv[1] == "setup":
+            from setup_agent import main as setup_main
+            return setup_main(sys.argv[2:])
         if sys.argv[1:] == ["approve"]:
             SESSION = ensure_session()
             return serve_approvals()

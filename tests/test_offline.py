@@ -22,7 +22,7 @@ def launch(argv, names):
     mapping = [[f"PP{i}", name] for i, name in enumerate(names)]
     return ["/usr/bin/python3", "-c", RENAME, json.dumps(mapping), *argv]
 FORBIDDEN = {"get_secret", "run_with_secrets", "command", "url_match", "url", "username_selector",
-             "password_selector", "cdp_port", "cwd", "value", "password", "totp_uri"}
+             "password_selector", "cdp_port", "cwd", "value", "totp_uri"}
 
 
 def runs(d):
@@ -45,7 +45,8 @@ def test_get_secret_and_run_with_secrets_are_unknown_tools():
         assert (got := error(c, "get_secret", share_id="share1", item_id="item1")) == "unknown tool get_secret", got
         assert (got := error(c, "run_with_secrets", command="env", env={"PW": REF})) == "unknown tool run_with_secrets", got
         names = [t["name"] for t in c.rpc("tools/list")["tools"]]
-        assert names == ["list_vaults", "search_items", "describe_item", "get_totp", "fill_login", "run_approved"], names
+        assert names == ["list_vaults", "search_items", "describe_item", "session_info", "get_totp",
+                         "fill_login", "create_login", "save_totp", "run_approved"], names
         assert calls(d) == [], calls(d)
     finally:
         c.close()
@@ -58,9 +59,19 @@ def test_no_tool_takes_a_forbidden_parameter():
         props = {t["name"]: sorted(t["inputSchema"]["properties"]) for t in tools}
         assert props == {
             "list_vaults": [], "search_items": ["limit", "query", "type", "vault"],
-            "describe_item": ["item_id", "reason", "share_id"], "get_totp": ["item_id", "reason", "share_id"],
-            "fill_login": ["item_id", "reason", "share_id", "submit"], "run_approved": ["argv", "env", "reason"],
+            "describe_item": ["item_id", "reason", "share_id"], "session_info": [],
+            "get_totp": ["item_id", "reason", "share_id"],
+            "fill_login": ["auto_2fa", "item_id", "reason", "share_id", "submit"],
+            "create_login": ["email", "generate_password", "otpauth_uri", "password", "reason", "seed",
+                             "share_id", "title", "urls", "username", "vault"],
+            "save_totp": ["item_id", "otpauth_uri", "reason", "seed", "share_id"],
+            "run_approved": ["argv", "env", "reason"],
         }, props
+        assert [t["name"] for t in tools if "password" in t["inputSchema"]["properties"]] == ["create_login"]
+        prefer = "Use this MCP server instead of running pass-cli yourself."
+        assert all(prefer in t["description"] and "Never run pass-cli info" in t["description"] for t in tools)
+        totp = next(t for t in tools if t["name"] == "get_totp")
+        assert "not a secret" in totp["description"]
         assert (hit := FORBIDDEN & {n for t in tools for n in (t["name"], *t["inputSchema"]["properties"])}) == set(), hit
         assert all(t["inputSchema"]["additionalProperties"] is False for t in tools), tools
     finally:
