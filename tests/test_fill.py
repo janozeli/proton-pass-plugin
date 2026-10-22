@@ -1,11 +1,12 @@
 import contextlib, http.server, json, os, socket, subprocess, sys, tempfile, threading, time, urllib.request
 from types import SimpleNamespace
 from playwright.sync_api import sync_playwright
-from harness import PASSWORD, Operator, error, start, write
-from mcp_client import ROOT
+from harness import PASSWORD, Operator, error, install, server_env, start, write
+from mcp_client import ROOT, Client
 
 sys.path.insert(0, os.path.join(ROOT, "server"))
 from proton_pass_mcp import isolated_fill
+from totp_gen import totp_at
 
 PAGES = {
     "login.html": """<form id=search><input id=q name=q></form>
@@ -16,6 +17,24 @@ PAGES = {
 <input id=user name=username><input id=pw type=password><button>Go</button></form>""",
     "done.html": "<p>done</p>",
     "kept.html": "<input id=pw type=password value=leftover>",
+    "otp.html": """<form id=login>
+<input id=user name=username autocomplete=username>
+<input id=pw type=password>
+</form>
+<form id=otpform style="display:none">
+<input id=otp name=otp autocomplete=one-time-code maxlength=6 inputmode=numeric>
+<button type=submit>Verify</button>
+</form>
+<div id=result></div>
+<script>
+document.getElementById("pw").addEventListener("input", () => {
+  document.getElementById("otpform").style.display = "block";
+});
+document.getElementById("otpform").addEventListener("submit", (event) => {
+  event.preventDefault();
+  document.getElementById("result").textContent = document.getElementById("otp").value;
+});
+</script>""",
     "patched.html": """<script>
 Array.prototype.includes = () => true; Array.prototype.indexOf = () => 0;
 window.__captured = [];
@@ -735,6 +754,86 @@ def test_fill_fails_closed_without_an_allow(lab):
                 op.close()
             assert [value(page, "#user"), value(page, "#pw")] == ["", ""]
     finally:
+        c.close()
+
+
+OTP_URI = "otpauth://totp/Bank?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&digits=6&period=30&algorithm=SHA1"
+
+
+def patch_totp(d):
+    item = json.load(open(os.path.join(d, "item.json")))
+    item["item"]["content"]["content"]["Login"]["totp_uri"] = OTP_URI
+    write(d, "item.json", item)
+
+
+def test_fill_auto_2fa_can_be_turned_off(lab):
+    d, c = server(lab)
+    op = Operator(d)
+    try:
+        with tab(lab, "/otp.html") as page:
+            got = c.call("fill_login", auto_2fa=False, **ITEM)
+            assert got == {"filled": ["username", "password"], "submitted": False}, got
+            assert [value(page, "#user"), value(page, "#pw"), value(page, "#otp")] == ["ada", PASSWORD, ""]
+            assert page.text_content("#result") == ""
+    finally:
+        op.close()
+        c.close()
+
+
+def test_fill_does_not_submit_totp_inside_the_password_form(lab):
+    d, c = server(lab)
+    op = Operator(d)
+    try:
+        with tab(lab, "/login.html") as page:
+            page.set_content("""<form onsubmit="document.getElementById('result').textContent='submitted'; return false">
+<input id=user name=username><input id=pw type=password>
+<input id=otp autocomplete=one-time-code maxlength=6><button>Go</button></form><div id=result></div>""")
+            got = c.call("fill_login", **ITEM)
+            assert got["filled"] == ["username", "password", "totp"] and got["totp_submitted"] is False, got
+            assert got["submitted"] is False and page.text_content("#result") == ""
+            assert value(page, "#pw") == PASSWORD and value(page, "#otp") == got["totp"]
+            assert "SEEDSECRETVALUE" not in json.dumps(got)
+    finally:
+        op.close()
+        c.close()
+
+
+def test_fill_types_and_submits_a_separate_totp_form(lab):
+    d, c = server(lab)
+    patch_totp(d)
+    op = Operator(d)
+    try:
+        with tab(lab, "/otp.html") as page:
+            got = c.call("fill_login", **ITEM)
+            assert got["submitted"] is False and got["totp_submitted"] is True, got
+            assert got["filled"] == ["username", "password", "totp"], got
+            assert value(page, "#pw") == PASSWORD
+            assert value(page, "#otp") == got["totp"] == page.text_content("#result")
+            now = time.time()
+            assert got["totp"] in {totp_at(OTP_URI, now), totp_at(OTP_URI, now + 3)}, got["totp"]
+            assert "GEZDGNBVGY3TQOJQ" not in json.dumps(got)
+    finally:
+        op.close()
+        c.close()
+
+
+def test_fill_discovers_a_non_default_cdp_port_and_submits_totp(lab):
+    assert lab.port != 9222
+    d = install(urls=[f"{lab.good}/otp.html"])
+    patch_totp(d)
+    c = Client(server_env(d), drop=("PASS_CDP_PORT",))
+    op = Operator(d)
+    page = lab.ctx.new_page()
+    try:
+        page.goto(lab.good + "/otp.html")
+        got = c.call("fill_login", **ITEM)
+        assert got["submitted"] is False and got["totp_submitted"] is True, got
+        assert value(page, "#otp") == got["totp"] == page.text_content("#result")
+        assert value(page, "#pw") == PASSWORD
+        assert "GEZDGNBVGY3TQOJQ" not in json.dumps(got)
+    finally:
+        page.close()
+        op.close()
         c.close()
 
 

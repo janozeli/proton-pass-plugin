@@ -1,9 +1,9 @@
 {
   "name": "proton-pass",
   "displayName": "Proton Pass",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "repository": "https://github.com/janozeli/proton-pass-plugin",
-  "description": "Use Proton Pass from the agent via the official pass-cli: list vaults and search items, and after you approve each release in a terminal, fill a login into a browser tab, get a TOTP code, or run a sandboxed program with secrets in its environment. The model never sees secret values.",
+  "description": "Use Proton Pass from the agent via the official pass-cli. Setup creates a vault-scoped agent token with browser approval and never prints it. After you approve each release, the agent can fill a login (including a short-lived 2FA code), read a TOTP code, create a login, or run a sandboxed program. Passwords, notes, TOTP seeds, and the agent token never come back.",
   "author": { "name": "Lucas Janozeli" },
   "license": "MIT",
   "logo": "assets/logo.svg",
