@@ -17,13 +17,23 @@ Do not ask the user to paste a token. Ask them to run this in their terminal, na
 python3 ~/.cursor/plugins/local/proton-pass/server/proton_pass_mcp.py setup --vault "Bots" --name cursor-agent
 ```
 
-`pass-cli login` with no flags is web login: it prints a URL, the user approves it in a browser, and the CLI continues. Setup shows that URL, creates a vault-scoped agent token (`pass-cli agent create` plus `agent access grant`), writes only that token into the PAT file, then runs `pass-cli logout` and deletes the temporary full-account session. It never prints the token. The default role is `editor` so `create_login` and `save_totp` work. `--role viewer` keeps the token read-only. Public `pass-cli` has no `--interactive` login; that flag exists only in internal builds and this setup does not use it.
+`pass-cli login` with no flags is web login: it prints a URL, the user approves it in a browser, and the CLI continues. Setup shows that URL, creates a vault-scoped agent token (`pass-cli agent create` plus `agent access grant`), writes only that token into the PAT file, checks each vault's `share_role` with a fresh agent login, then runs `pass-cli logout` and deletes the temporary sessions. It never prints the token. The default role is `editor` so `create_login` and `save_totp` work. `--role viewer` keeps the token read-only. `--role manager` can also manage who has access to the vault. Public `pass-cli` has no `--interactive` login; that flag exists only in internal builds and this setup does not use it.
+
+The owner's primary `Personal` vault rejects `editor` with `NotAllowed`. `viewer` and `manager` work there. For editor access, ask the user to create a dedicated vault.
 
 `session_info` reports the token expiration recorded at setup. When fewer than 14 days remain it warns. Renewing repeats the browser approval and replaces the token:
 
 ```bash
 python3 ~/.cursor/plugins/local/proton-pass/server/proton_pass_mcp.py setup --renew
 ```
+
+To change one vault's role without a new token, ask the user to run:
+
+```bash
+python3 ~/.cursor/plugins/local/proton-pass/server/proton_pass_mcp.py setup --grant --vault "Bots" --role editor
+```
+
+The agent name comes from `pat.meta`. A second grant changes the role in place. Do not use `agent access revoke`; it returned `NotExists` for both the owner share id and the agent share id. `session_info` logs out and back in before it reads roles, so the new role shows up without a restart. Never run `pass-cli info`.
 
 Give each bot its own `PROTON_PASS_SESSION_DIR`. The server creates that directory mode 0700, owned by the user, and refuses a symlink or a directory owned by someone else. Do not point two bots at one session directory.
 
@@ -56,7 +66,7 @@ Always pass a short `reason`. The user reads it in the approval prompt, and Prot
 - If `fill_login` fails with `more than one open tab matches this item's websites (N tabs open)`, close the extra tabs on that site, then try again.
 - If `fill_login` fails because more than one Chrome is listening, open the site in one of them, pass `cdp_port`, or ask the user to set `PASS_CDP_PORT`.
 - If `fill_login` returns `totp` as `detect_failed`, the password is filled and the 2FA field was not found. Call `get_totp` and ask the user to type the code.
-- If `create_login` or `save_totp` says reading and filling still work, the token is read-only on that vault. Tell the user write access is required. Do not retry with another tool.
+- If `create_login` or `save_totp` says reading and filling still work, the token is read-only on that vault. Tell the user write access is required. They can change the role with `setup --grant`. Do not retry with another tool, and do not run `pass-cli info` or `agent access revoke`.
 - If `save_totp` says the login cannot be recreated, it has a note, extra fields, or passkeys. Ask the user to add the TOTP in Proton Pass, or create a new login with `create_login`.
 - If `run_approved` fails with `bwrap is not installed`, tell the user that `run_approved` needs bubblewrap.
 - If `fill_login` fails with `automatic submission is unavailable; fill without submit and submit manually`, omit `submit` and ask the user to submit the form. Do not look for another tool that posts the password.

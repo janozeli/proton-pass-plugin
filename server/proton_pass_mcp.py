@@ -860,7 +860,21 @@ def access_of(role):
     return "read", "unknown"
 
 
+def refresh_agent_session():
+    # share_role stays cached in PROTON_PASS_SESSION_DIR/.session until a new
+    # login. Logout deletes that directory and leaves approve.sock beside it.
+    # Never call `pass-cli info`; a logged-out response can delete the session.
+    for args in (["logout"], ["logout", "--force"]):
+        try:
+            subprocess.run([PASS_CLI, *args], env=cli_env(REASON), stdin=subprocess.DEVNULL,
+                           capture_output=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    login()
+
+
 def share_rows():
+    refresh_agent_session()
     return cli_json("share", "list", "--only-vaults=true")["shares"]
 
 
@@ -1043,7 +1057,7 @@ TOOLS = {
     "search_items": (search_items, PREFER + "Search items by title (case-insensitive substring). Metadata only, no secrets.",
                      {"query": S, "vault": S, "type": {"type": "string", "enum": ["login", "note", "alias", "credit-card", "identity", "ssh-key", "wifi", "custom"]}, "limit": {"type": "integer"}}, []),
     "describe_item": (describe_item, PREFER + "Item metadata: website origins (scheme, host, and port only), username, email, has_password, has_totp, extra field names. No path, query, fragment, or secret values.", ITEM, ["share_id", "item_id"]),
-    "session_info": (session_info, PREFER + "Read-only session report: agent-token identity, agent name, each vault's Proton role and read or write access, and the agent token expiration recorded by setup. Warns when fewer than 14 days remain and includes the renew command. Does not call pass-cli info.", {}, []),
+    "session_info": (session_info, PREFER + "Read-only session report: agent-token identity, agent name, each vault's Proton role and read or write access, and the agent token expiration recorded by setup. Warns when fewer than 14 days remain and includes the renew command. Logs out and back in before reading roles so a grant is visible. Does not call pass-cli info.", {}, []),
     "get_totp": (get_totp, PREFER + "Current TOTP code from the item's totp field, after the operator approves in the approval terminal. Returns only the digits." + CODE, ITEM, ["share_id", "item_id", "reason"]),
     "fill_login": (fill_login, PREFER + "After the operator approves, type the item's username and password into the one open Chrome tab whose origin equals one of the item's saved websites. Optional cdp_port is a loopback remote-debugging port and wins over PASS_CDP_PORT and auto-discovery. Otherwise PASS_CDP_PORT selects the browser, or the loopback Chrome whose open page matches the item is used, and several unmatched browsers are an error. The password never comes back. When auto_2fa is true (the default) and the page shows a TOTP field, the current code is typed too; a separate 2FA form is submitted, and the password form is not. If detecting that field fails, totp is detect_failed and the password fill is still returned. Set auto_2fa to false to skip that. Automatic password submission is refused: omit submit or set it to false. submitted is always false." + CODE,
                    {**ITEM, "submit": {"type": "boolean"}, "auto_2fa": {"type": "boolean", "description": "Type the current TOTP code when the page asks for one. Defaults to true."},

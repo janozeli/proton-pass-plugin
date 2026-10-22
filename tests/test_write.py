@@ -1,5 +1,5 @@
 import json, os, re, time
-from harness import PASSWORD, SERVER, Operator, calls, error, start, write
+from harness import PASSWORD, SERVER, Operator, calls, error, session, start, write
 
 
 def logins(d):
@@ -194,6 +194,46 @@ def test_save_totp_delete_failure_removes_the_new_item_or_names_both_ids():
         assert SEED not in json.dumps(got) and PASSWORD not in json.dumps(got)
     finally:
         op.close()
+        c.close()
+
+
+def test_session_info_refreshes_a_stale_share_role_without_calling_info():
+    d, c = start()
+    try:
+        write(d, "stale-shares.json", {"shares": [
+            {"id": "share1", "name": "V", "share_type": "Vault", "share_role": "Viewer"}]})
+        editor(d)
+        marker = os.path.join(session(d), "keep")
+        with open(marker, "w") as handle:
+            handle.write("keep")
+        info = c.call("session_info")
+        assert info["vaults"][0]["role"] == "Editor" and info["vaults"][0]["access"] == "write", info
+        assert os.path.exists(marker) and os.path.isdir(session(d))
+        seen = calls(d)
+        share_at = next(i for i, call in enumerate(seen) if call[:2] == ["share", "list"])
+        assert any(call[:1] == ["logout"] for call in seen[:share_at]), seen
+        assert ["login"] in seen[:share_at]
+        assert all(call[:1] != ["info"] for call in seen), seen
+        assert "pst_" not in json.dumps(info)
+    finally:
+        c.close()
+
+
+def test_require_write_refreshes_a_stale_viewer_role_before_refusing():
+    d, c = start()
+    try:
+        write(d, "stale-shares.json", {"shares": [
+            {"id": "share1", "name": "V", "share_type": "Vault", "share_role": "Viewer"}]})
+        editor(d)
+        got = error(c, "create_login", vault="V", title="Mail", password=PASSWORD, reason="save")
+        assert got == "approval unavailable", got
+        assert not any(call[:3] == ["item", "create", "login"] for call in calls(d)), calls(d)
+        seen = calls(d)
+        share_at = next(i for i, call in enumerate(seen) if call[:2] == ["share", "list"])
+        assert any(call[:1] == ["logout"] for call in seen[:share_at]), seen
+        assert all(call[:1] != ["info"] for call in seen)
+        assert all(PASSWORD not in json.dumps(call) for call in seen)
+    finally:
         c.close()
 
 

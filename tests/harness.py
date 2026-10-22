@@ -32,7 +32,12 @@ if args == ["login"]:
     json.dump(env, open(path("login-env.json"), "w"))
     if os.path.exists(path("login-fail")):
         finish(err="rejected " + env.get("PROTON_PASS_PERSONAL_ACCESS_TOKEN", ""), code=1)
+    if os.path.exists(path("did-logout")):
+        open(path("fresh-login"), "w").close()
     open(path("ok"), "w").close()
+    finish()
+if args[:1] == ["logout"]:
+    open(path("did-logout"), "a").close()
     finish()
 if not os.path.exists(path("ok")):
     finish(err="Error: This operation requires an authenticated client", code=1)
@@ -60,8 +65,13 @@ if args[:2] == ["run", "--"]:
     secrets = json.load(open(path("secrets.json")))
     child = {k: secrets[v[len("pass://"):]] if v.startswith("pass://") else v for k, v in env.items()}
     os.execve(args[2], args[2:], child)
+if args[:2] == ["share", "list"]:
+    source = "shares.json"
+    if os.path.exists(path("stale-shares.json")) and not os.path.exists(path("fresh-login")):
+        source = "stale-shares.json"
+    finish(open(path(source)).read())
 replies = {"vault list": "vaults.json", "item list": "items.json", "item view": "item.json",
-           "item totp": "totp.json", "share list": "shares.json"}
+           "item totp": "totp.json"}
 name = replies.get(" ".join(args[:2]))
 if not name:
     finish(err="unexpected " + " ".join(args), code=1)
