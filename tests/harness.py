@@ -48,7 +48,11 @@ if args[:3] == ["item", "create", "login"]:
     open(path("created.json"), "w").write(sys.stdin.read())
     finish("item-new\n")
 if args[:2] == ["item", "delete"]:
+    item_id = args[args.index("--item-id") + 1] if "--item-id" in args else ""
     open(path("deleted"), "a").write(json.dumps(args) + "\n")
+    blocked = open(path("delete-fail")).read().split() if os.path.exists(path("delete-fail")) else []
+    if item_id in blocked:
+        finish(err="delete failed", code=1)
     finish()
 if args[:2] == ["run", "--"]:
     json.dump(env, open(path("run-env.json"), "w"))

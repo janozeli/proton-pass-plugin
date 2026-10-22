@@ -27,8 +27,6 @@ jobs:
           python3 -m playwright install --with-deps chromium
       - name: Offline tests
         run: |
-          python3 tests/test_core.py
-          python3 tests/test_relogin.py
-          python3 tests/test_offline.py
-          python3 tests/test_tabs.py
-          python3 tests/test_fill.py
+          for test in tests/test_*.py; do
+            python3 "$test"
+          done

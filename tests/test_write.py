@@ -154,6 +154,7 @@ def test_save_totp_recreates_a_plain_login_and_refuses_items_that_would_lose_fie
         op = Operator(d)
         got = c.call("save_totp", share_id="share1", item_id="item1", seed=SEED, reason="add 2fa")
         assert got == {"item_id": "item-new", "replaced_item_id": "item1"}, got
+        assert "item id will change" in op.prompts[-1]["change"] and "item1" in op.prompts[-1]["change"]
         blob = json.dumps(got) + json.dumps(op.prompts)
         assert SEED not in blob and PASSWORD not in blob and "otpauth:" not in blob
         body = created(d)
@@ -163,6 +164,36 @@ def test_save_totp_recreates_a_plain_login_and_refuses_items_that_would_lose_fie
     finally:
         if op:
             op.close()
+        c.close()
+
+
+def failure(text):
+    body = json.loads(text)
+    assert "replaced_item_id" in body, body
+    return body
+
+
+def test_save_totp_delete_failure_removes_the_new_item_or_names_both_ids():
+    d, c = start()
+    editor(d)
+    plain_item(d)
+    op = Operator(d)
+    try:
+        write(d, "delete-fail", "item1\n")
+        got = failure(error(c, "save_totp", share_id="share1", item_id="item1", seed=SEED, reason="add 2fa"))
+        assert got["item_id"] == "item1" and got["replaced_item_id"] == "item1", got
+        assert got["removed_item_id"] == "item-new" and "no duplicate remains" in got["error"], got
+        assert SEED not in json.dumps(got) and PASSWORD not in json.dumps(got)
+        deleted = open(os.path.join(d, "deleted")).read()
+        assert "item1" in deleted and "item-new" in deleted
+        os.remove(os.path.join(d, "deleted"))
+        write(d, "delete-fail", "item1 item-new\n")
+        got = failure(error(c, "save_totp", share_id="share1", item_id="item1", seed=SEED, reason="add 2fa"))
+        assert got["item_id"] == "item-new" and got["replaced_item_id"] == "item1", got
+        assert "Both items exist" in got["error"], got
+        assert SEED not in json.dumps(got) and PASSWORD not in json.dumps(got)
+    finally:
+        op.close()
         c.close()
 
 

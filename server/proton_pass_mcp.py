@@ -15,7 +15,7 @@ REF = re.compile(r"pass://([^/?#%]+)/([^/?#%]+)/([^/?#%]+)")
 PROTOCOL = "2025-06-18"
 SUPPORTED = {"2024-11-05", "2025-03-26", PROTOCOL}
 FORBIDDEN = {"get_secret", "run_with_secrets", "command", "url_match", "url", "username_selector",
-             "password_selector", "cdp_port", "cwd", "value", "totp_uri"}
+             "password_selector", "cwd", "value", "totp_uri"}
 RESERVED_ENV = {"PATH", "HOME", "LD_PRELOAD", "LD_LIBRARY_PATH", "PROTON_PASS_SESSION_DIR", "PROTON_PASS_AGENT_REASON",
                 "PROTON_PASS_PERSONAL_ACCESS_TOKEN", "PASS_PAT_FILE", "PASS_CLI"}
 # pass-cli puts the resolved secrets in the environment it hands to bwrap, so the sandbox unsets
@@ -66,6 +66,14 @@ SESSION = None
 
 class PassError(Exception):
     pass
+
+
+class ResultError(PassError):
+    """Tool failure whose text is JSON, so callers still receive the fields."""
+
+    def __init__(self, payload):
+        super().__init__("tool failed")
+        self.payload = payload
 
 
 def ensure_session():
@@ -435,9 +443,9 @@ FILL = """function(arg, ...closedRoots) {
   return filled;
 }"""
 
-def cdp_endpoint(origins):
+def cdp_endpoint(origins, explicit=None):
     try:
-        return discover_cdp(os.environ.get("PASS_CDP_PORT"), origins, browser_origin)
+        return discover_cdp(os.environ.get("PASS_CDP_PORT"), origins, browser_origin, explicit=explicit)
     except DiscoverError as exc:
         raise PassError(str(exc))
 
@@ -457,7 +465,7 @@ def fill_login(a):
     if not origins:
         raise PassError("item has no website to fill")
     submit = a.get("submit", False)
-    endpoint = cdp_endpoint(origins)
+    endpoint = cdp_endpoint(origins, a.get("cdp_port"))
     with sync_playwright() as p:
         browser = p.chromium.connect_over_cdp(endpoint)
         try:
@@ -480,12 +488,7 @@ def fill_login(a):
             totp = maybe_fill_totp(page, allowed, lg.get("totp_uri")) if a.get("auto_2fa", True) else None
         finally:
             browser.close()
-    result = {"filled": filled, "submitted": False}
-    if totp:
-        result["filled"] = filled + ["totp"]
-        result["totp"] = totp["code"]
-        result["totp_submitted"] = totp["submitted"]
-    return result
+    return with_totp({"filled": filled, "submitted": False}, totp)
 
 
 def isolated_fill(page, arg):
@@ -650,14 +653,28 @@ def isolated_call(page, function, arg):
         session.detach()
 
 
+def with_totp(result, totp):
+    if not totp:
+        return result
+    if totp.get("status") == "detect_failed":
+        result["totp"] = "detect_failed"
+        return result
+    result["filled"] = result["filled"] + ["totp"]
+    result["totp"] = totp["code"]
+    result["totp_submitted"] = totp["submitted"]
+    return result
+
+
 def maybe_fill_totp(page, origin, uri):
     if not uri:
         return None
     try:
         found = isolated_call(page, OTP_DETECT, {"origin": origin})
-    except PassError:
-        return None
-    if not isinstance(found, dict) or not found.get("found"):
+    except Exception:
+        return {"status": "detect_failed"}
+    if not isinstance(found, dict):
+        return {"status": "detect_failed"}
+    if not found.get("found"):
         return None
     try:
         code = totp_code(uri)
@@ -976,7 +993,14 @@ def save_totp(a):
         raise PassError("pass-cli cannot edit a login TOTP in place. Recreating this item would drop its note, "
                         "extra fields, or passkeys. Add the TOTP in the Proton Pass app, or create a new login with create_login.")
     title = content.get("title") or "login"
-    release({"action": "write", "title": title, "change": "attach TOTP by replacing the login", "reason": a["reason"]})
+    old_id = a["item_id"]
+    # item update --field totp_uri does not change LoginItem.totp_uri. Upstream
+    # update_login_field ignores "totp" and "totp_uri", and the CLI then appends
+    # a custom text field. Editing an existing TOTP extra field errors with
+    # "Editing TOTP fields is unsupported". Replacement is the supported write.
+    release({"action": "write", "title": title,
+             "change": f"create a new login and delete item {old_id}. pass-cli cannot edit a login TOTP in place, so the item id will change.",
+             "reason": a["reason"]})
     template = {"title": title, "password": login["password"], "urls": list(login.get("urls") or []), "totp_uri": uri}
     if login.get("username"):
         template["username"] = login["username"]
@@ -984,12 +1008,26 @@ def save_totp(a):
         template["email"] = login["email"]
     stdout = cli("item", "create", "login", "--share-id", a["share_id"], "--from-template", "-",
                   reason=a["reason"], stdin_text=json.dumps(template))
-    new_id = item_id_from(stdout, login["password"], uri, a.get("seed") or "", a.get("otpauth_uri") or "")
+    hidden = (login["password"], uri, a.get("seed") or "", a.get("otpauth_uri") or "")
+    new_id = item_id_from(stdout, *hidden)
     try:
-        cli("item", "delete", "--share-id", a["share_id"], "--item-id", a["item_id"], reason=a["reason"])
+        cli("item", "delete", "--share-id", a["share_id"], "--item-id", old_id, reason=a["reason"])
     except PassError:
-        raise PassError(f"created item {new_id} with TOTP but could not delete {a['item_id']}")
-    return {"item_id": new_id, "replaced_item_id": a["item_id"]}
+        try:
+            cli("item", "delete", "--share-id", a["share_id"], "--item-id", new_id, reason=a["reason"])
+        except PassError:
+            raise ResultError({
+                "item_id": new_id,
+                "replaced_item_id": old_id,
+                "error": "created a new login but could not delete the previous item or the new one. Both items exist; delete one of them.",
+            })
+        raise ResultError({
+            "item_id": old_id,
+            "replaced_item_id": old_id,
+            "removed_item_id": new_id,
+            "error": "could not delete the previous item, so the new login was removed. The item id is unchanged and no duplicate remains.",
+        })
+    return {"item_id": new_id, "replaced_item_id": old_id}
 
 
 S = {"type": "string"}
@@ -1007,13 +1045,14 @@ TOOLS = {
     "describe_item": (describe_item, PREFER + "Item metadata: website origins (scheme, host, and port only), username, email, has_password, has_totp, extra field names. No path, query, fragment, or secret values.", ITEM, ["share_id", "item_id"]),
     "session_info": (session_info, PREFER + "Read-only session report: agent-token identity, agent name, each vault's Proton role and read or write access, and the agent token expiration recorded by setup. Warns when fewer than 14 days remain and includes the renew command. Does not call pass-cli info.", {}, []),
     "get_totp": (get_totp, PREFER + "Current TOTP code from the item's totp field, after the operator approves in the approval terminal. Returns only the digits." + CODE, ITEM, ["share_id", "item_id", "reason"]),
-    "fill_login": (fill_login, PREFER + "After the operator approves, type the item's username and password into the one open Chrome tab whose origin equals one of the item's saved websites. PASS_CDP_PORT selects the browser; otherwise the loopback Chrome whose open page matches the item is used, and several unmatched browsers are an error. The password never comes back. When auto_2fa is true (the default) and the page shows a TOTP field, the current code is typed too; a separate 2FA form is submitted, and the password form is not. Set auto_2fa to false to skip that. Automatic password submission is refused: omit submit or set it to false. submitted is always false." + CODE,
-                   {**ITEM, "submit": {"type": "boolean"}, "auto_2fa": {"type": "boolean", "description": "Type the current TOTP code when the page asks for one. Defaults to true."}}, ["share_id", "item_id", "reason"]),
+    "fill_login": (fill_login, PREFER + "After the operator approves, type the item's username and password into the one open Chrome tab whose origin equals one of the item's saved websites. Optional cdp_port is a loopback remote-debugging port and wins over PASS_CDP_PORT and auto-discovery. Otherwise PASS_CDP_PORT selects the browser, or the loopback Chrome whose open page matches the item is used, and several unmatched browsers are an error. The password never comes back. When auto_2fa is true (the default) and the page shows a TOTP field, the current code is typed too; a separate 2FA form is submitted, and the password form is not. If detecting that field fails, totp is detect_failed and the password fill is still returned. Set auto_2fa to false to skip that. Automatic password submission is refused: omit submit or set it to false. submitted is always false." + CODE,
+                   {**ITEM, "submit": {"type": "boolean"}, "auto_2fa": {"type": "boolean", "description": "Type the current TOTP code when the page asks for one. Defaults to true."},
+                    "cdp_port": {"type": "integer", "description": "Loopback Chrome remote-debugging port. Wins over PASS_CDP_PORT and auto-discovery."}}, ["share_id", "item_id", "reason"]),
     "create_login": (create_login, PREFER + "Create a login in one vault after the operator approves. Pass share_id or vault, plus title, and either password or generate_password. Optional username, email, urls, and otpauth_uri or seed. The password and any TOTP seed are stored and never returned. A read-only agent token returns an error that reading and filling still work.",
                      {"share_id": S, "vault": S, "title": S, "username": S, "email": S, "password": S,
                       "generate_password": {"type": "boolean"}, "urls": {"type": "array", "items": S},
                       "otpauth_uri": S, "seed": S, "reason": WHY}, ["title", "reason"]),
-    "save_totp": (save_totp, PREFER + "Attach or replace the TOTP on a plain login after the operator approves. Pass otpauth_uri or a base32 seed. pass-cli item update cannot edit a login TOTP, so a login with no note, extra fields, or passkeys is recreated and the previous item is deleted. The seed and password are never returned. A read-only agent token returns an error that reading and filling still work." + CODE,
+    "save_totp": (save_totp, PREFER + "Attach or replace the TOTP on a plain login after the operator approves. Pass otpauth_uri or a base32 seed. pass-cli item update cannot edit a login TOTP in place, so this creates a new item and deletes the previous one. The item id changes. The approval prompt says so. Success and a delete failure both include replaced_item_id. If the previous item cannot be deleted, the new item is removed when that is possible; if both remain, the error names both ids. A login with a note, extra fields, or passkeys is refused. The seed and password are never returned. A read-only agent token returns an error that reading and filling still work." + CODE,
                   {"share_id": S, "item_id": S, "otpauth_uri": S, "seed": S, "reason": WHY}, ["share_id", "item_id", "reason"]),
     "run_approved": (run_approved, PREFER + "After the operator approves this exact argv, run it in a bubblewrap sandbox with pass://SHARE_ID/ITEM_ID/FIELD references injected as environment variables. The sandbox sees /usr, /bin, and /lib read-only, /etc name-service and TLS files, and an empty /tmp. It has no network unless the operator allows it. Output is discarded. Returns only the exit code.",
                      {"argv": {"type": "array", "items": S, "description": "Absolute path of the program, then its arguments. No shell is added."},
@@ -1063,6 +1102,8 @@ def handle(msg):
         try:
             validate(name, args)
             res = {"content": [{"type": "text", "text": json.dumps(TOOLS[name][0](args), ensure_ascii=False, indent=1)}]}
+        except ResultError as e:
+            res = {"content": [{"type": "text", "text": json.dumps(e.payload, ensure_ascii=False, indent=1)}], "isError": True}
         except PassError as e:
             res = {"content": [{"type": "text", "text": e.args[0]}], "isError": True}
         except Exception:

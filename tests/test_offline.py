@@ -22,7 +22,7 @@ def launch(argv, names):
     mapping = [[f"PP{i}", name] for i, name in enumerate(names)]
     return ["/usr/bin/python3", "-c", RENAME, json.dumps(mapping), *argv]
 FORBIDDEN = {"get_secret", "run_with_secrets", "command", "url_match", "url", "username_selector",
-             "password_selector", "cdp_port", "cwd", "value", "totp_uri"}
+             "password_selector", "cwd", "value", "totp_uri"}
 
 
 def runs(d):
@@ -61,7 +61,7 @@ def test_no_tool_takes_a_forbidden_parameter():
             "list_vaults": [], "search_items": ["limit", "query", "type", "vault"],
             "describe_item": ["item_id", "reason", "share_id"], "session_info": [],
             "get_totp": ["item_id", "reason", "share_id"],
-            "fill_login": ["auto_2fa", "item_id", "reason", "share_id", "submit"],
+            "fill_login": ["auto_2fa", "cdp_port", "item_id", "reason", "share_id", "submit"],
             "create_login": ["email", "generate_password", "otpauth_uri", "password", "reason", "seed",
                              "share_id", "title", "urls", "username", "vault"],
             "save_totp": ["item_id", "otpauth_uri", "reason", "seed", "share_id"],
@@ -72,17 +72,21 @@ def test_no_tool_takes_a_forbidden_parameter():
         assert all(prefer in t["description"] and "Never run pass-cli info" in t["description"] for t in tools)
         totp = next(t for t in tools if t["name"] == "get_totp")
         assert "not a secret" in totp["description"]
+        fill = next(t for t in tools if t["name"] == "fill_login")
+        assert "cdp_port" in fill["description"] and "detect_failed" in fill["description"]
+        save = next(t for t in tools if t["name"] == "save_totp")
+        assert "item id changes" in save["description"] and "replaced_item_id" in save["description"]
         assert (hit := FORBIDDEN & {n for t in tools for n in (t["name"], *t["inputSchema"]["properties"])}) == set(), hit
         assert all(t["inputSchema"]["additionalProperties"] is False for t in tools), tools
     finally:
         c.close()
 
 
-def test_fill_login_rejects_url_match_selectors_and_cdp_port():
+def test_fill_login_rejects_url_match_and_selectors():
     d, c = start()
     try:
         for key, value in (("url_match", "127.0.0.1:8765"), ("username_selector", "#q"),
-                           ("password_selector", "#q"), ("cdp_port", 9333)):
+                           ("password_selector", "#q")):
             got = error(c, "fill_login", share_id="share1", item_id="item1", reason="log in", **{key: value})
             assert got == f"unknown argument {key}", got
         assert calls(d) == [], calls(d)
@@ -90,13 +94,28 @@ def test_fill_login_rejects_url_match_selectors_and_cdp_port():
         c.close()
 
 
+def test_cdp_port_argument_is_validated_and_wins_over_the_environment():
+    d, c = start(PASS_CDP_PORT="2")
+    try:
+        got = error(c, "fill_login", cdp_port=0, share_id="share1", item_id="item1", reason="log in")
+        assert got == "cdp_port is invalid", got
+        got = error(c, "fill_login", cdp_port=65536, share_id="share1", item_id="item1", reason="log in")
+        assert got == "cdp_port is invalid", got
+        got = error(c, "fill_login", cdp_port="9222", share_id="share1", item_id="item1", reason="log in")
+        assert got == "cdp_port must be an integer", got
+        got = error(c, "fill_login", cdp_port=1, share_id="share1", item_id="item1", reason="log in")
+        assert got == "no browser is listening on CDP port 1", got
+    finally:
+        c.close()
+
+
 def test_startup_refuses_a_forbidden_parameter_name():
     d = install()
     code = ("import sys; sys.path.insert(0, %r); import proton_pass_mcp as m; "
-            "m.TOOLS['fill_login'][2]['cdp_port'] = {'type': 'integer'}; m.main()") % os.path.dirname(SERVER)
+            "m.TOOLS['fill_login'][2]['url'] = {'type': 'string'}; m.main()") % os.path.dirname(SERVER)
     r = subprocess.run([sys.executable, "-c", code], env=dict(os.environ, **server_env(d)),
                        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
-    assert (r.returncode, r.stderr) == (1, "proton-pass: forbidden tool or parameter name: cdp_port\n"), r
+    assert (r.returncode, r.stderr) == (1, "proton-pass: forbidden tool or parameter name: url\n"), r
 
 
 def test_run_child_has_no_network_and_no_host_secrets_under_approve():
