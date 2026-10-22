@@ -83,6 +83,25 @@ def test_explicit_port_overrides_other_candidates_and_rejects_a_non_loopback_soc
         evil.shutdown()
 
 
+def test_tool_port_wins_over_the_environment_and_other_candidates():
+    chosen = serve("https://bank.example/login")
+    other = serve("https://other.example/login")
+    try:
+        got = discover_cdp(str(other.server_address[1]), {"https://bank.example"}, origin_of,
+                           candidates=[other.server_address[1]], explicit=chosen.server_address[1])
+        assert got == f"ws://127.0.0.1:{chosen.server_address[1]}/devtools/browser/abc-1", got
+        for value in (0, 65536, "nope", True, 1.5):
+            try:
+                discover_cdp(str(chosen.server_address[1]), set(), origin_of, explicit=value)
+            except DiscoverError as exc:
+                assert str(exc) == "cdp_port is invalid", (value, exc)
+            else:
+                raise AssertionError(f"invalid cdp_port {value!r} was accepted")
+    finally:
+        chosen.shutdown()
+        other.shutdown()
+
+
 def test_no_browser_is_an_error():
     try:
         discover_cdp(None, {"https://bank.example"}, origin_of, candidates=[])

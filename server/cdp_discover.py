@@ -1,8 +1,9 @@
 """Find a loopback Chrome DevTools endpoint.
 
-An explicit PASS_CDP_PORT wins. Otherwise this scans browser command lines and
-DevToolsActivePort files. Several live browsers are disambiguated by an open
-page on the item's origin; a tie is an error and does not guess.
+An explicit port wins over PASS_CDP_PORT, which wins over a scan of browser
+command lines and DevToolsActivePort files. Several live browsers are
+disambiguated by an open page on the item's origin; a tie is an error and
+does not guess.
 """
 import http.client, json, os, re
 from urllib.parse import urlsplit
@@ -12,13 +13,15 @@ class DiscoverError(Exception):
     pass
 
 
-def parse_port(value):
+def parse_port(value, source="PASS_CDP_PORT"):
     try:
+        if isinstance(value, bool) or isinstance(value, float):
+            raise ValueError
         port = int(value)
     except (TypeError, ValueError):
-        raise DiscoverError("PASS_CDP_PORT is invalid")
+        raise DiscoverError(f"{source} is invalid")
     if not 1 <= port <= 65535:
-        raise DiscoverError("PASS_CDP_PORT is invalid")
+        raise DiscoverError(f"{source} is invalid")
     return port
 
 
@@ -150,7 +153,9 @@ def page_urls(port):
     return [item.get("url") or "" for item in payload if isinstance(item, dict) and item.get("type") == "page"]
 
 
-def discover_cdp(env_port, origins, origin_of, candidates=None):
+def discover_cdp(env_port, origins, origin_of, candidates=None, explicit=None):
+    if explicit is not None:
+        return connect(parse_port(explicit, "cdp_port"))
     if env_port not in (None, ""):
         return connect(parse_port(env_port))
     ports = scan_ports() if candidates is None else list(candidates)
@@ -163,7 +168,7 @@ def discover_cdp(env_port, origins, origin_of, candidates=None):
     if not verified:
         raise DiscoverError(
             "no Chrome with remote debugging is listening on 127.0.0.1. "
-            "Start Chrome with --remote-debugging-port, or set PASS_CDP_PORT.")
+            "Start Chrome with --remote-debugging-port, pass cdp_port, or set PASS_CDP_PORT.")
     if len(verified) == 1:
         return verified[0][1]
     matched = []
@@ -176,4 +181,4 @@ def discover_cdp(env_port, origins, origin_of, candidates=None):
     shown = ", ".join(str(port) for port, _ in (matched or verified))
     raise DiscoverError(
         "more than one Chrome with remote debugging is listening on 127.0.0.1 "
-        f"(ports {shown}). Open the item's website in one of them, or set PASS_CDP_PORT.")
+        f"(ports {shown}). Open the item's website in one of them, pass cdp_port, or set PASS_CDP_PORT.")

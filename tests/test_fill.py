@@ -5,7 +5,7 @@ from harness import PASSWORD, Operator, error, install, server_env, start, write
 from mcp_client import ROOT, Client
 
 sys.path.insert(0, os.path.join(ROOT, "server"))
-from proton_pass_mcp import isolated_fill
+from proton_pass_mcp import isolated_fill, maybe_fill_totp, with_totp
 from totp_gen import totp_at
 
 PAGES = {
@@ -813,6 +813,61 @@ def test_fill_types_and_submits_a_separate_totp_form(lab):
             assert got["totp"] in {totp_at(OTP_URI, now), totp_at(OTP_URI, now + 3)}, got["totp"]
             assert "GEZDGNBVGY3TQOJQ" not in json.dumps(got)
     finally:
+        op.close()
+        c.close()
+
+
+def test_totp_detection_failure_is_reported_and_a_missing_field_is_not(lab):
+    class Broken:
+        @property
+        def context(self):
+            raise OSError("cdp closed")
+
+    class Empty:
+        def __init__(self, value):
+            self.value = value
+            self.context = self
+
+        def new_cdp_session(self, page):
+            value = self.value
+
+            class Session:
+                def send(self, method, params=None):
+                    if method == "Page.getFrameTree":
+                        return {"frameTree": {"frame": {"id": "f"}}}
+                    if method == "Page.createIsolatedWorld":
+                        return {"executionContextId": 1}
+                    if method == "Runtime.callFunctionOn":
+                        return {"result": {"value": value}}
+                    return {}
+
+                def detach(self):
+                    pass
+
+            return Session()
+
+    uri = "otpauth://totp/Bank?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
+    assert maybe_fill_totp(Broken(), "https://bank.example", uri) == {"status": "detect_failed"}
+    assert maybe_fill_totp(Empty(None), "https://bank.example", uri) == {"status": "detect_failed"}
+    assert maybe_fill_totp(Empty({"found": False}), "https://bank.example", uri) is None
+    assert maybe_fill_totp(Empty({"found": False}), "https://bank.example", "") is None
+    base = {"filled": ["username", "password"], "submitted": False}
+    assert with_totp(dict(base), {"status": "detect_failed"}) == {**base, "totp": "detect_failed"}
+    assert with_totp(dict(base), None) == base
+
+
+def test_fill_cdp_port_argument_wins_over_the_environment(lab):
+    assert lab.port != 1
+    d, c = start(urls=[f"{lab.good}/login.html"], PASS_CDP_PORT="1")
+    op = Operator(d)
+    page = lab.ctx.new_page()
+    try:
+        page.goto(lab.good + "/login.html")
+        got = c.call("fill_login", cdp_port=lab.port, **ITEM)
+        assert got == {"filled": ["username", "password"], "submitted": False}, got
+        assert value(page, "#pw") == PASSWORD
+    finally:
+        page.close()
         op.close()
         c.close()
 
