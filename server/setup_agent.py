@@ -7,6 +7,7 @@ directory. A grant is checked with a second temporary login. Token values are
 never printed.
 """
 import fcntl, json, os, pty, re, select, shutil, stat, subprocess, sys, tempfile, time
+from shared_state import operation_lock, lock_file, unlock
 
 EXPIRATIONS = {"1h": 3600, "1d": 86400, "1w": 604800, "1m": 30 * 86400, "3m": 90 * 86400,
                "6m": 180 * 86400, "1y": 365 * 86400}
@@ -109,7 +110,7 @@ def meta_path():
 
 
 def pass_cli():
-    return os.path.expanduser(os.environ.get("PASS_CLI", "~/.local/bin/pass-cli"))
+    return os.path.expanduser(os.environ.get("PASS_CLI", shutil.which("pass-cli") or "~/.local/bin/pass-cli"))
 
 
 def child_env(session_dir):
@@ -133,6 +134,11 @@ def private_dir():
 
 
 def write_private(path, text):
+    with operation_lock():
+        return _write_private(path, text)
+
+
+def _write_private(path, text):
     path = os.path.abspath(path)
     parent = os.path.dirname(path)
     os.makedirs(parent, exist_ok=True)
@@ -163,8 +169,8 @@ def checked_name(name):
     return name
 
 
-def read_meta():
-    path = meta_path()
+def read_meta(path=None):
+    path = path or meta_path()
     try:
         st = os.lstat(path)
     except OSError:
@@ -426,60 +432,76 @@ def configured_message(name, roles, expires_at, verified):
     return "\n".join(lines)
 
 
-def run(opts):
+def save_issued_token(token, name, roles, expiration):
+    """Persist the only copy before any grant/list/verification can fail."""
+    with operation_lock():
+        write_private(pat_path(), token)
+        write_private(pat_path() + ".pending", json.dumps({
+            "name": name, "vaults": list(roles), "roles": roles,
+            "expiration": expiration, "expires_at": int(time.time()) + EXPIRATIONS[expiration],
+        }))
+
+
+def run(opts, login_fn=None, report=None):
     cli = pass_cli()
     full_dir = verify_dir = None
     full_env = verify_env = None
     message = None
     try:
-        if opts["grant"] or opts["renew"]:
-            meta = read_meta()
+        if opts["grant"] or opts["renew"] or opts.get("resume"):
+            meta = read_meta(pat_path() + ".pending" if opts.get("resume") else None)
             name = meta["name"]
-            token = read_pat() if opts["grant"] else None
+            token = read_pat() if opts["grant"] or opts.get("resume") else None
         else:
             meta = None
             name = opts["name"]
             token = None
         full_dir = private_dir()
         full_env = child_env(full_dir)
-        run_login(cli, full_env)
-        if opts["grant"]:
-            vault, role = opts["vaults"][0], opts["role"]
-            grant_access(cli, full_env, name, vault, role)
+        (login_fn or run_login)(cli, full_env)
+        if opts["grant"] or opts.get("resume"):
             roles = stored_roles(meta)
-            roles[vault] = role
+            requested = roles if opts.get("resume") else {opts["vaults"][0]: opts["role"]}
+            if opts["grant"]:
+                pending = {**meta, "roles": {**roles, **requested}, "vaults": list({**roles, **requested})}
+                write_private(pat_path() + ".pending", json.dumps(pending))
+            for vault, role in requested.items():
+                grant_access(cli, full_env, name, vault, role)
+            roles.update(requested)
             verify_dir = private_dir()
             verify_env = child_env(verify_dir)
             verify_env["PROTON_PASS_PERSONAL_ACCESS_TOKEN"] = token
             token = None
-            verify_roles(cli, verify_env, {vault: role})
+            verify_roles(cli, verify_env, requested)
             expires_at = meta.get("expires_at")
             write_meta(name, roles, expires_at, meta.get("expiration"))
             message = configured_message(name, roles, expires_at, verified=True)
         elif opts["renew"]:
             stdout = run_capture(cli, ["agent", "renew", name, "--expiration", opts["expiration"]], full_env)
             token = extract_token(stdout)
+            save_issued_token(token, name, stored_roles(meta), opts["expiration"])
             listed = run_capture(cli, ["agent", "list", "--output", "json"], full_env)
             expires_at = expire_from_list(listed, name, int(time.time()) + EXPIRATIONS[opts["expiration"]])
             roles = stored_roles(meta)
             if not roles:
                 raise SetupError("agent metadata is missing vault roles; run setup --vault NAME")
-            write_private(pat_path(), token)
+            verify_dir = private_dir()
+            verify_env = child_env(verify_dir)
+            verify_env["PROTON_PASS_PERSONAL_ACCESS_TOKEN"] = token
             token = None
+            verify_roles(cli, verify_env, roles)
             write_meta(name, roles, expires_at, opts["expiration"])
-            message = configured_message(name, roles, expires_at, verified=False)
+            message = configured_message(name, roles, expires_at, verified=True)
         else:
             role = opts["role"]
             roles = {vault: role for vault in opts["vaults"]}
             stdout = run_capture(cli, ["agent", "create", name, "--expiration", opts["expiration"]], full_env)
+            token = extract_token(stdout)
+            save_issued_token(token, name, roles, opts["expiration"])
             for vault in roles:
                 grant_access(cli, full_env, name, vault, role)
-            # agent create shows the token once. Save it before the role check
-            # so a failed check does not throw away the only copy.
-            token = extract_token(stdout)
             listed = run_capture(cli, ["agent", "list", "--output", "json"], full_env)
             expires_at = expire_from_list(listed, name, int(time.time()) + EXPIRATIONS[opts["expiration"]])
-            write_private(pat_path(), token)
             verify_dir = private_dir()
             verify_env = child_env(verify_dir)
             verify_env["PROTON_PASS_PERSONAL_ACCESS_TOKEN"] = token
@@ -498,11 +520,27 @@ def run(opts):
             logout(cli, full_env, full_dir)
     if any(path and os.path.exists(path) for path in (full_dir, verify_dir)):
         raise SetupError("the session directory could not be deleted")
-    print(message, file=sys.stderr)
+    try:
+        os.unlink(pat_path() + ".pending")
+    except FileNotFoundError:
+        pass
+    if report is None:
+        print(message, file=sys.stderr)
+    else:
+        report(message)
 
 
 def main(argv=None):
+    fd = None
     try:
-        run(parse_args(sys.argv[1:] if argv is None else argv))
+        opts = parse_args(sys.argv[1:] if argv is None else argv)
+        try:
+            fd = lock_file(pat_path() + ".setup.lock", blocking=False)
+        except BlockingIOError:
+            raise SetupError("another Bot or terminal is already setting up this account")
+        run(opts)
     except SetupError as exc:
         sys.exit("proton-pass: " + redact(str(exc)))
+    finally:
+        if fd is not None:
+            unlock(fd)

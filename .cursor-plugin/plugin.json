@@ -1,14 +1,27 @@
 {
   "name": "proton-pass",
   "displayName": "Proton Pass",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "repository": "https://github.com/janozeli/proton-pass-plugin",
-  "description": "Use Proton Pass from the agent via the official pass-cli. Setup creates a vault-scoped agent token with browser approval and never prints it. After you approve each release, the agent can fill a login (including a short-lived 2FA code), read a TOTP code, create a login, or run a sandboxed program. Passwords, notes, TOTP seeds, and the agent token never come back.",
-  "author": { "name": "Lucas Janozeli" },
+  "description": "Proton Pass for Grok Bot cloud computers. Connect through Proton web login, share scoped access across Bots, and fill passwords and OTPs without returning their values. Sensitive operations request human approval through MCP elicitation.",
+  "author": {
+    "name": "Lucas Janozeli"
+  },
   "license": "MIT",
   "logo": "assets/logo.svg",
-  "keywords": ["proton", "proton pass", "password manager", "secrets", "totp", "mcp"],
+  "keywords": [
+    "proton",
+    "proton pass",
+    "password manager",
+    "secrets",
+    "totp",
+    "mcp"
+  ],
   "category": "integrations",
-  "tags": ["passwords", "secrets", "mcp"],
+  "tags": [
+    "passwords",
+    "secrets",
+    "mcp"
+  ],
   "mcpServers": "./mcp.json"
 }
