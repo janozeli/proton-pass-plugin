@@ -1,0 +1,15 @@
+{
+  "name": "proton-pass",
+  "owner": {
+    "name": "Lucas Janozeli"
+  },
+  "metadata": {
+    "description": "Personal marketplace for the Proton Pass plugin."
+  },
+  "plugins": [
+    {
+      "name": "proton-pass",
+      "source": "."
+    }
+  ]
+}
