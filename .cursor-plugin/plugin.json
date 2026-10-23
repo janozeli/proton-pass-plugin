@@ -10,6 +10,5 @@
   "keywords": ["proton", "proton pass", "password manager", "secrets", "totp", "mcp"],
   "category": "integrations",
   "tags": ["passwords", "secrets", "mcp"],
-  "mcpServers": "./mcp.json",
-  "skills": "./skills/"
+  "mcpServers": "./mcp.json"
 }

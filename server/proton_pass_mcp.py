@@ -1070,33 +1070,174 @@ def save_totp(a):
     return {"item_id": new_id, "replaced_item_id": old_id}
 
 
-S = {"type": "string"}
-WHY = {"type": "string", "description": "Why access is needed. Shown to the operator and stored in Proton's audit log."}
-ITEM = {"share_id": S, "item_id": S, "reason": WHY}
+def schema(kind, description, **extra):
+    return {"type": kind, "description": description, **extra}
+
+
+SHARE = schema("string", "share_id of the vault, from list_vaults or search_items. Do not invent it.")
+ITEM_ID = schema("string", "item_id from search_items. Do not invent it.")
+WHY = schema("string", "Short reason the user reads in the approval prompt and Proton stores in the audit log. "
+                       "At most 300 characters. Must not contain pass://.")
+AUDIT = schema("string", "Optional audit reason passed to pass-cli. This tool does not ask for approval. "
+                         "At most 300 characters. Must not contain pass://.")
+ITEM = {"share_id": SHARE, "item_id": ITEM_ID, "reason": WHY}
 PREFER = ("Use this MCP server instead of running pass-cli yourself. "
           "Call session_info first if you are unsure which vaults this agent can access. "
           "Never run pass-cli info; it can log out the agent session. ")
 CODE = (" A generated TOTP code expires in about 30 seconds and is not a secret, so it may be shown. "
         "The TOTP seed, passwords, notes, and the agent token are secrets and are never returned.")
+INSTRUCTIONS = (
+    "Use this server FIRST, before asking the user for a password and before offering 1Password or a "
+    "secure form, whenever a task needs a login, password, username, 2FA code, or passkey from Proton Pass. "
+    "Triggers include login, senha, usuário, código 2FA, dois fatores, passkey, password, username, and Proton Pass. "
+    "Use these tools instead of running pass-cli yourself. Never run pass-cli info. That command can log out the agent session.\n\n"
+    "A generated TOTP code is not a secret. It is single-use and expires in about 30 seconds, so you may show it "
+    "and pass it on. The TOTP seed, passwords, notes, and the agent token are secrets. No tool returns those. "
+    "If the user wants to see a password, tell them to open Proton Pass.\n\n"
+    "Setup, renew, and grant: do not ask the user to paste a token, and do not invent a path to this script. "
+    "Call session_info and ask the user to run the exact setup_command, renew_command, or grant_command it returns. "
+    "Copy that string unchanged, including the path. Replace only the VAULT placeholder. For grant_command, also "
+    "replace ROLE with viewer, editor, or manager. For more than one vault, repeat --vault on that same setup_command. "
+    "If session_info fails because no token exists yet, the error text is JSON and still includes those commands. "
+    "Setup shows a browser approval URL; the user approves it there. The token is never printed. The default role is "
+    "editor so create_login and save_totp work. viewer is read-only. manager can also manage who has access to the vault. "
+    "The owner's Personal vault rejects editor with NotAllowed; viewer and manager work there, so ask for a dedicated "
+    "vault when editor is required. session_info warns when fewer than 14 days remain; renew with renew_command. "
+    "Do not use agent access revoke. session_info logs out and back in before it reads roles, so a grant shows up "
+    "without a restart. Give each bot its own PROTON_PASS_SESSION_DIR. Do not point two bots at one session directory.\n\n"
+    "Read-only vaults: session_info sets access to read when the Proton role is Viewer or unknown, and write for "
+    "Editor, Manager, or Owner. list_vaults, search_items, describe_item, fill_login, and get_totp work with read "
+    "access. create_login and save_totp stop with an error that says reading and filling still work. Tell the user "
+    "that. Do not try pass-cli directly to get around it.\n\n"
+    "Tool order: (1) Call session_info when scope or token expiration is unclear. (2) Find the item with "
+    "search_items (title substring, optional type login). It returns share_id and item_id. (3) Check it with "
+    "describe_item. It shows each saved website's origin (scheme, host, and port), the username, has_password, "
+    "and has_totp. It does not show the path or the query. (4) Use one release tool. Each release waits until the "
+    "user types approve in the approval helper's terminal. Never start that helper and never type into its terminal. "
+    "Only the user may answer. Always pass a short reason. To log into a site, open the saved origin in one tab and "
+    "call fill_login. For a code you will type, call get_totp and you may show the digits. To save a new login, call "
+    "create_login. To add TOTP to an existing plain login, call save_totp. For a program that needs a key, call "
+    "run_approved. It returns only the exit code and has no network unless the user types approve-net. Per-tool "
+    "rules are on that tool's description. Passkeys are created by the site and the Proton Pass browser authenticator, "
+    "not by pass-cli. There is no command that registers a passkey. Do not invent a Chrome virtual authenticator. "
+    "Ask the user to create the passkey in Proton Pass.\n\n"
+    "Errors: "
+    "If a release fails with approval unavailable, ask the user to start the approval helper as the README describes. "
+    "Never start the helper yourself and never type into its terminal. "
+    "If a release fails with release denied, the user said no or did not answer in time. Do not retry unless the user asks. "
+    "If fill_login fails with 'no open tab matches this item's websites (N tabs open)', open one of the URLs that "
+    "describe_item lists, then try again. "
+    "If fill_login fails with 'more than one open tab matches this item's websites (N tabs open)', close the extra "
+    "tabs on that site, then try again. "
+    "If fill_login fails because more than one Chrome is listening, open the site in one of them, pass cdp_port, or "
+    "ask the user to set PASS_CDP_PORT. "
+    "If fill_login returns totp as detect_failed, the password is filled and the 2FA field was not found. detect_failed "
+    "is a status, not a code. Call get_totp and ask the user to type the code. "
+    "If create_login or save_totp says reading and filling still work, the token is read-only on that vault. Tell the "
+    "user write access is required. They can change the role by running the exact grant_command from session_info. "
+    "Do not retry with another tool, and do not run pass-cli info or agent access revoke. "
+    "If save_totp says the login cannot be recreated, it has a note, extra fields, or passkeys. Ask the user to add "
+    "the TOTP in Proton Pass, or create a new login with create_login. "
+    "If run_approved fails with 'bwrap is not installed', tell the user that run_approved needs bubblewrap. "
+    "If fill_login fails with 'automatic submission is unavailable; fill without submit and submit manually', omit "
+    "submit and ask the user to submit the form. Do not look for another tool that posts the password."
+)
 TOOLS = {
-    "list_vaults": (list_vaults, PREFER + "List Proton Pass vaults (names and ids). Metadata only.", {}, []),
-    "search_items": (search_items, PREFER + "Search items by title (case-insensitive substring). Metadata only, no secrets.",
-                     {"query": S, "vault": S, "type": {"type": "string", "enum": ["login", "note", "alias", "credit-card", "identity", "ssh-key", "wifi", "custom"]}, "limit": {"type": "integer"}}, []),
-    "describe_item": (describe_item, PREFER + "Item metadata: website origins (scheme, host, and port only), username, email, has_password, has_totp, extra field names. No path, query, fragment, or secret values.", ITEM, ["share_id", "item_id"]),
-    "session_info": (session_info, PREFER + "Read-only session report: agent-token identity, agent name, each vault's Proton role and read or write access, and the agent token expiration recorded by setup. Warns when fewer than 14 days remain. Includes setup_command, renew_command, and grant_command, each python3 plus this server's absolute path. If the token is missing or login fails, the error text is JSON and still includes those commands. Logs out and back in before reading roles so a grant is visible. Does not call pass-cli info.", {}, []),
-    "get_totp": (get_totp, PREFER + "Current TOTP code from the item's totp field, after the operator approves in the approval terminal. Returns only the digits." + CODE, ITEM, ["share_id", "item_id", "reason"]),
-    "fill_login": (fill_login, PREFER + "After the operator approves, type the item's username and password into the one open Chrome tab whose origin equals one of the item's saved websites. Optional cdp_port is a loopback remote-debugging port and wins over PASS_CDP_PORT and auto-discovery. Otherwise PASS_CDP_PORT selects the browser, or the loopback Chrome whose open page matches the item is used, and several unmatched browsers are an error. The password never comes back. When auto_2fa is true (the default) and the page shows a TOTP field, the current code is typed too; a separate 2FA form is submitted, and the password form is not. If detecting that field fails, totp is detect_failed and the password fill is still returned. Set auto_2fa to false to skip that. Automatic password submission is refused: omit submit or set it to false. submitted is always false." + CODE,
-                   {**ITEM, "submit": {"type": "boolean"}, "auto_2fa": {"type": "boolean", "description": "Type the current TOTP code when the page asks for one. Defaults to true."},
-                    "cdp_port": {"type": "integer", "description": "Loopback Chrome remote-debugging port. Wins over PASS_CDP_PORT and auto-discovery."}}, ["share_id", "item_id", "reason"]),
-    "create_login": (create_login, PREFER + "Create a login in one vault after the operator approves. Pass share_id or vault, plus title, and either password or generate_password. Optional username, email, urls, and otpauth_uri or seed. The password and any TOTP seed are stored and never returned. A read-only agent token returns an error that reading and filling still work.",
-                     {"share_id": S, "vault": S, "title": S, "username": S, "email": S, "password": S,
-                      "generate_password": {"type": "boolean"}, "urls": {"type": "array", "items": S},
-                      "otpauth_uri": S, "seed": S, "reason": WHY}, ["title", "reason"]),
-    "save_totp": (save_totp, PREFER + "Attach or replace the TOTP on a plain login after the operator approves. Pass otpauth_uri or a base32 seed. pass-cli item update cannot edit a login TOTP in place, so this creates a new item and deletes the previous one. The item id changes. The approval prompt says so. Success and a delete failure both include replaced_item_id. If the previous item cannot be deleted, the new item is removed when that is possible; if both remain, the error names both ids. A login with a note, extra fields, or passkeys is refused. The seed and password are never returned. A read-only agent token returns an error that reading and filling still work." + CODE,
-                  {"share_id": S, "item_id": S, "otpauth_uri": S, "seed": S, "reason": WHY}, ["share_id", "item_id", "reason"]),
-    "run_approved": (run_approved, PREFER + "After the operator approves this exact argv, run it in a bubblewrap sandbox with pass://SHARE_ID/ITEM_ID/FIELD references injected as environment variables. The sandbox sees /usr, /bin, and /lib read-only, /etc name-service and TLS files, and an empty /tmp. It has no network unless the operator allows it. Output is discarded. Returns only the exit code.",
-                     {"argv": {"type": "array", "items": S, "description": "Absolute path of the program, then its arguments. No shell is added."},
-                      "env": {"type": "object", "additionalProperties": S, "description": "Variable name to pass://SHARE_ID/ITEM_ID/FIELD reference."},
+    "list_vaults": (list_vaults, PREFER + "List Proton Pass vaults (names and ids). Metadata only. No approval.", {}, []),
+    "search_items": (search_items, PREFER + "Search items by title (case-insensitive substring). Optional type, such as login. "
+                     "Returns share_id and item_id. Trashed items are omitted. Metadata only, no secrets.",
+                     {"query": schema("string", "Case-insensitive title substring. Omit or leave empty to match every title."),
+                      "vault": schema("string", "Optional vault name. Omit to search every vault this token can read."),
+                      "type": schema("string", "Optional item type. Use login when looking up a website login.",
+                                     enum=["login", "note", "alias", "credit-card", "identity", "ssh-key", "wifi", "custom"]),
+                      "limit": schema("integer", "Maximum items to return. Must be >= 0. Defaults to 25.")}, []),
+    "describe_item": (describe_item, PREFER + "Item metadata: website origins (scheme, host, and port only), username, "
+                      "email, has_password, has_totp, extra field names. No path, query, fragment, or secret values. "
+                      "Use the origins to open exactly one matching tab before fill_login.",
+                      {"share_id": SHARE, "item_id": ITEM_ID, "reason": AUDIT}, ["share_id", "item_id"]),
+    "session_info": (session_info, PREFER + "Read-only session report: agent-token identity, agent name, each vault's "
+                     "Proton role and read or write access, and the agent token expiration recorded by setup. Warns when "
+                     "fewer than 14 days remain. Includes setup_command, renew_command, and grant_command, each python3 "
+                     "plus this server's absolute path. Copy those strings unchanged. Replace only VAULT, and for "
+                     "grant_command also ROLE with viewer, editor, or manager. Do not invent a path to this script. "
+                     "If the token is missing or login fails, the error text is JSON and still includes those commands. "
+                     "Logs out and back in before reading roles so a grant is visible. Does not call pass-cli info.", {}, []),
+    "get_totp": (get_totp, PREFER + "Current TOTP code from the item's totp field, after the user approves in the approval "
+                 "terminal. Returns only the digits. You may show them. The seed is not returned." + CODE,
+                 ITEM, ["share_id", "item_id", "reason"]),
+    "fill_login": (fill_login, PREFER + "After the user approves, type the item's username and password into the one open "
+                   "Chrome tab whose origin equals one of the item's saved websites. A subdomain or a different port does "
+                   "not match. If no tab matches, or more than one tab matches, nothing is typed. Optional cdp_port is a "
+                   "loopback remote-debugging port and wins over PASS_CDP_PORT and auto-discovery. If it is omitted and "
+                   "PASS_CDP_PORT is set, that port is used. Otherwise the server finds a Chrome on 127.0.0.1 and, when "
+                   "several are running, picks the one with a page on the item's origin. If more than one still matches, "
+                   "it lists the ports and does not guess. Omit submit or set it to false. Automatic password submission "
+                   "is refused before filling. submitted is always false, which means the password form was not submitted. "
+                   "auto_2fa defaults to true. After the username and password are typed, if the page shows a one-time-code "
+                   "field and the item has TOTP, the current code is typed. If fewer than 3 seconds remain in the time step, "
+                   "the server waits for the next code. A code field in its own form is submitted (totp_submitted true). "
+                   "A code field in the password form is filled and not submitted, because that would send the password. "
+                   "If detecting the field fails, the result is still the password fill and totp is detect_failed, a status, "
+                   "not a code. Call get_totp for the code. Set auto_2fa to false to skip this. The password and the seed "
+                   "never come back." + CODE,
+                   {**ITEM,
+                    "submit": schema("boolean", "Omit or set false. Automatic password submission is refused before filling. "
+                                     "submitted in the result is always false. The user submits the password form."),
+                    "auto_2fa": schema("boolean", "Defaults to true. After username and password, type the current TOTP code "
+                                       "when the page shows a one-time-code field and the item has TOTP. If fewer than 3 seconds "
+                                       "remain, wait for the next code. A code field in its own form is submitted (totp_submitted "
+                                       "true). A code field in the password form is filled and not submitted. If detection fails, "
+                                       "totp is detect_failed (a status, not a code) and the password fill is still returned; then "
+                                       "call get_totp. Set false to skip."),
+                    "cdp_port": schema("integer", "Optional loopback Chrome remote-debugging port on 127.0.0.1. Wins over "
+                                       "PASS_CDP_PORT and auto-discovery. Pass it when more than one Chrome is listening.")},
+                   ["share_id", "item_id", "reason"]),
+    "create_login": (create_login, PREFER + "Create a login in one vault after the user approves. Pass share_id or vault, "
+                     "plus title, and either password or generate_password. Optional username, email, urls, and otpauth_uri "
+                     "or seed. You get item_id only. The password and any TOTP seed are stored and never returned. This does "
+                     "not register a passkey. A read-only agent token returns an error that reading and filling still work.",
+                     {"share_id": schema("string", "Vault share id from list_vaults. Pass share_id or vault, not both."),
+                      "vault": schema("string", "Vault name from list_vaults. Pass vault or share_id, not both."),
+                      "title": schema("string", "Login title stored in Proton Pass. The user sees it in the approval prompt."),
+                      "username": schema("string", "Optional username stored on the login. Omit it when the login uses email only."),
+                      "email": schema("string", "Optional email stored on the login. Omit it when the login uses username only."),
+                      "password": schema("string", "Password to store. Pass password or generate_password, not both. "
+                                        "It is written to the vault and never returned."),
+                      "generate_password": schema("boolean", "When true, the server generates a password, stores it, and does "
+                                                 "not return it. Do not also pass password."),
+                      "urls": schema("array", "Optional website URLs saved on the login. fill_login later matches their origins.",
+                                     items={"type": "string"}),
+                      "otpauth_uri": schema("string", "Optional otpauth URI to store. Pass otpauth_uri or seed, not both. "
+                                           "The seed is not returned."),
+                      "seed": schema("string", "Optional base32 TOTP seed. Pass seed or otpauth_uri, not both. Not returned."),
+                      "reason": WHY}, ["title", "reason"]),
+    "save_totp": (save_totp, PREFER + "Attach or replace the TOTP on a plain login after the user approves. Pass otpauth_uri "
+                  "or a base32 seed. pass-cli item update cannot edit a login TOTP in place, so this creates a new item and "
+                  "deletes the previous one. The item id changes. The approval prompt says so. Success and a delete failure "
+                  "both include replaced_item_id. If the previous item cannot be deleted, the new item is removed when that "
+                  "is possible; if both remain, the error names both ids. Tell the user both ids and ask which one to delete. "
+                  "A login with a note, extra fields, or passkeys is refused so those fields are not dropped. The seed and "
+                  "password are never returned. A read-only agent token returns an error that reading and filling still work." + CODE,
+                  {"share_id": SHARE, "item_id": ITEM_ID,
+                   "otpauth_uri": schema("string", "otpauth URI to attach. Pass otpauth_uri or seed, not both. Not returned."),
+                   "seed": schema("string", "Base32 TOTP seed. Pass seed or otpauth_uri, not both. Not returned."),
+                   "reason": WHY}, ["share_id", "item_id", "reason"]),
+    "run_approved": (run_approved, PREFER + "After the user approves this exact argv, run it in a bubblewrap sandbox with "
+                     "pass://SHARE_ID/ITEM_ID/FIELD references injected as environment variables. A reference is exactly that "
+                     "form, with no ?, #, or %. argv[0] must be an absolute path. No shell is added. The sandbox sees /usr, "
+                     "/bin, and /lib, plus /etc/resolv.conf, /etc/hosts, /etc/nsswitch.conf, and /etc/ssl, with a private "
+                     "/proc and an empty /tmp as its working directory. It cannot read the workspace or the home directory. "
+                     "Do not put a secret in LD_AUDIT, LD_PRELOAD, or another loader variable. Those names never reach the "
+                     "sandbox launcher. It has no network unless the user types approve-net, so say so when the program needs "
+                     "the network. Hostnames resolve only after approve-net. You get only the exit code. If you need the "
+                     "program's output or the workspace, this tool does not fit. Ask the user to run the program themselves.",
+                     {"argv": schema("array", "Program and arguments. argv[0] is an absolute path, for example "
+                                    "[\"/usr/bin/psql\", \"--host=127.0.0.1\"]. No shell is added. Each element is at most "
+                                    "1024 characters.", items={"type": "string"}),
+                      "env": schema("object", "Map of environment variable name to a reference exactly "
+                                   "pass://SHARE_ID/ITEM_ID/FIELD, with no ?, #, or %. Do not use LD_AUDIT, LD_PRELOAD, or "
+                                   "another loader variable. Those names never reach the sandbox.",
+                                   additionalProperties={"type": "string"}),
                       "reason": WHY}, ["argv", "env", "reason"]),
 }
 
@@ -1130,7 +1271,8 @@ def handle(msg):
         if version not in SUPPORTED:
             version = PROTOCOL
         return _result(mid, {"protocolVersion": version, "capabilities": {"tools": {}},
-                             "serverInfo": {"name": "proton-pass", "version": "0.3.0"}})
+                             "serverInfo": {"name": "proton-pass", "version": "0.3.0"},
+                             "instructions": INSTRUCTIONS})
     if method == "tools/list":
         tools = [{"name": n, "description": d, "inputSchema": {"type": "object", "properties": p, "required": r, "additionalProperties": False}}
                  for n, (_, d, p, r) in TOOLS.items()]

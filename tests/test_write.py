@@ -1,5 +1,5 @@
 import json, os, re, shlex, time
-from harness import PASSWORD, ROOT, SERVER, Operator, calls, error, session, start, write
+from harness import PASSWORD, SERVER, Operator, calls, error, session, start, write
 
 
 def logins(d):
@@ -43,7 +43,7 @@ def test_session_info_never_calls_info_and_the_session_still_works():
         c.close()
 
 
-def test_session_info_commands_use_this_script_and_the_skill_has_no_install_path():
+def test_session_info_commands_use_this_script_and_instructions_have_no_install_path():
     d, c = start()
     try:
         info = c.call("session_info")
@@ -55,9 +55,11 @@ def test_session_info_commands_use_this_script_and_the_skill_has_no_install_path
         for key in ("setup_command", "renew_command", "grant_command"):
             assert script in info[key], info[key]
             assert "~/.cursor/plugins/local" not in info[key]
-        skill = open(os.path.join(ROOT, "skills", "proton-pass", "SKILL.md")).read()
-        assert "~/.cursor/plugins/local" not in skill
-        assert "setup_command" in skill and "renew_command" in skill and "grant_command" in skill
+        c.send({"jsonrpc": "2.0", "id": 70, "method": "initialize",
+                "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t"}}})
+        text = c.read()["result"]["instructions"]
+        assert "~/.cursor/plugins/local" not in text
+        assert "setup_command" in text and "renew_command" in text and "grant_command" in text
         os.remove(os.path.join(d, "pat"))
         failed = json.loads(error(c, "session_info"))
         assert failed["error"] == "PAT file cannot be read", failed
