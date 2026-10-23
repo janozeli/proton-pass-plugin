@@ -59,7 +59,7 @@ def test_session_info_commands_use_this_script_and_instructions_have_no_install_
                 "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t"}}})
         text = c.read()["result"]["instructions"]
         assert "~/.cursor/plugins/local" not in text
-        assert "setup_command" in text and "renew_command" in text and "grant_command" in text
+        assert "connect" in text and "renew" in text and "grant" in text
         os.remove(os.path.join(d, "pat"))
         failed = json.loads(error(c, "session_info"))
         assert failed["error"] == "PAT file cannot be read", failed
@@ -81,7 +81,7 @@ def test_session_info_warns_below_14_days_and_hides_a_token_stored_beside_the_me
         blob = json.dumps(info)
         assert "pst_" not in blob and "SHOULD_NOT_LEAK" not in blob, blob
         assert info["name"] == "cursor-agent" and info["days_remaining"] == 10, info
-        assert info["expiration_warning"] is True and "setup --renew" in info["warning"], info
+        assert info["expiration_warning"] is True and "mode=renew" in info["warning"], info
         later = int(time.time()) + 20 * 86400 + 100
         write(d, "pat.meta", {"name": "cursor-agent", "expires_at": later, "vaults": ["V"]})
         os.chmod(os.path.join(d, "pat.meta"), 0o600)

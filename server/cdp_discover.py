@@ -30,7 +30,9 @@ def ports_from_cmdline(raw):
     blob = " ".join(parts).lower()
     if not any(name in blob for name in ("chrome", "chromium", "msedge", "brave")):
         return []
-    found = []
+    # Recent Chromium rewrites /proc argv as one space-separated title.
+    # Probe candidates before trusting them, exactly as for ordinary argv.
+    found = [int(m.group(1)) for m in re.finditer(r"(?:^|\s)--remote-debugging-port(?:=|\s+)([0-9]+)(?=\s|$)", blob) if int(m.group(1)) > 0]
     for index, arg in enumerate(parts):
         value = None
         if arg.startswith("--remote-debugging-port="):
@@ -39,7 +41,7 @@ def ports_from_cmdline(raw):
             value = parts[index + 1]
         if value and value.isdigit() and int(value) > 0:
             found.append(int(value))
-    return found
+    return list(dict.fromkeys(found))
 
 
 def port_from_devtools(text):

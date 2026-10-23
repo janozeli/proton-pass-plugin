@@ -117,7 +117,7 @@ def session(d):
 
 def server_env(d, **env):
     # HOME moves to a temp dir, so pin the user site that may hold Playwright.
-    return {"HOME": os.path.join(d, "home"), "PYTHONUSERBASE": site.getuserbase(),
+    return {"PASS_APPROVAL_MODE": "terminal", "HOME": os.path.join(d, "home"), "PYTHONUSERBASE": site.getuserbase(),
             "PASS_CLI": os.path.join(d, "pass-cli"), "PASS_PAT_FILE": os.path.join(d, "pat"),
             "PROTON_PASS_SESSION_DIR": session(d), "OTHER_HOST_SECRET": HOST_SECRET, **env}
 

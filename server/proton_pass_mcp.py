@@ -5,8 +5,14 @@ from urllib.parse import urlsplit
 import idna
 from cdp_discover import DiscoverError, discover_cdp
 from totp_gen import TotpError, normalize_totp, totp_code
+from shared_state import operation_lock
+from mcp_peer import Peer, ConsentError
+from cloud_connection import Manager
+import setup_agent
+import concurrent.futures
+import threading
 
-PASS_CLI = os.path.expanduser(os.environ.get("PASS_CLI", "~/.local/bin/pass-cli"))
+PASS_CLI = os.path.expanduser(os.environ.get("PASS_CLI", shutil.which("pass-cli") or "~/.local/bin/pass-cli"))
 PAT_FILE = os.path.expanduser(os.environ.get("PASS_PAT_FILE", "~/.config/pass-agent/pat"))
 REASON = "proton-pass plugin"
 AUTH_ERR = re.compile(r"requires an authenticated client|unauthori[sz]ed|session expired", re.I)
@@ -62,6 +68,9 @@ RENAME = (
     "os.execv(sys.argv[2],sys.argv[2:])\n"
 )
 SESSION = None
+PEER = None
+CONNECTIONS = Manager()
+OUTPUT_LOCK = threading.Lock()
 
 
 class PassError(Exception):
@@ -96,7 +105,10 @@ def ensure_session():
 
 
 def cli_env(reason, extra=None):
-    return {"PATH": os.environ.get("PATH", os.defpath), "PROTON_PASS_SESSION_DIR": SESSION,
+    provider = {k: os.environ[k] for k in ("PROTON_PASS_KEY_PROVIDER", "PROTON_PASS_LINUX_KEYRING", "PROTON_PASS_ENCRYPTION_KEY") if k in os.environ}
+    if provider.get("PROTON_PASS_LINUX_KEYRING") == "dbus":
+        provider.update({k: os.environ[k] for k in ("DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR") if k in os.environ})
+    return {**provider, "PATH": os.environ.get("PATH", os.defpath), "PROTON_PASS_SESSION_DIR": SESSION,
             "PROTON_PASS_AGENT_REASON": reason, **(extra or {})}
 
 
@@ -212,6 +224,14 @@ def peer_uid(sock):
 
 
 def release(prompt):
+    if os.environ.get("PASS_APPROVAL_MODE", "mcp") != "terminal":
+        if PEER is None:
+            raise PassError("MCP user approval is unavailable")
+        message = render(prompt).replace("Type approve to release. Anything else denies.", "Approve only if this matches your request.").replace("off (type approve-net to allow it)", "off unless you also allow network access")
+        try:
+            return PEER.consent(message, network=prompt["action"] == "run")
+        except ConsentError as exc:
+            raise PassError(str(exc))
     with socket.socket(socket.AF_UNIX) as s:
         s.settimeout(APPROVAL_TIMEOUT)
         try:
@@ -360,13 +380,37 @@ def describe_item(a):
     }
 
 
-def get_totp(a):
-    release({"action": "totp", "title": view_item(a)["content"]["title"], "reason": a["reason"]})
-    data = cli_json("item", "totp", *item_args(a), reason=a["reason"])
-    code = data.get("totp")
-    if not isinstance(code, str) or not re.fullmatch(r"[0-9]{6,8}", code):
-        raise PassError("item has no TOTP code")
-    return {"code": code}
+def fill_totp(a):
+    """Fill a later OTP-only screen without ever returning the code."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        raise PassError("fill_totp needs the Playwright Python package")
+    item = view_item(a)
+    lg = login_content(item)
+    if not lg or not lg.get("totp_uri"):
+        raise PassError("item has no TOTP secret")
+    origins = {browser_origin(u) for u in lg.get("urls", [])} - {None}
+    if not origins:
+        raise PassError("item has no website to fill")
+    endpoint = cdp_endpoint(origins, a.get("cdp_port"))
+    with sync_playwright() as p:
+        browser = p.chromium.connect_over_cdp(endpoint)
+        try:
+            pages = [pg for ctx in browser.contexts for pg in ctx.pages]
+            hits = [pg for pg in pages if browser_origin(pg.url) in origins]
+            if len(hits) != 1:
+                raise PassError("exactly one open tab must match this item's websites")
+            page = hits[0]
+            origin = browser_origin(page.url)
+            release({"action": "fill", "title": item["content"]["title"], "origin": origin,
+                     "submit": False, "reason": a["reason"]})
+            totp = maybe_fill_totp(page, origin, lg["totp_uri"])
+            if not totp:
+                raise PassError("no one-time-code field on the matching tab")
+            return with_totp({"filled": [], "submitted": False}, totp)
+        finally:
+            browser.close()
 
 
 FILL = """function(arg, ...closedRoots) {
@@ -660,7 +704,7 @@ def with_totp(result, totp):
         result["totp"] = "detect_failed"
         return result
     result["filled"] = result["filled"] + ["totp"]
-    result["totp"] = totp["code"]
+    result["totp"] = "filled"
     result["totp_submitted"] = totp["submitted"]
     return result
 
@@ -689,7 +733,7 @@ def maybe_fill_totp(page, origin, uri):
         raise PassError("the password is filled, but the TOTP field could not be filled")
     if not isinstance(wrote, dict) or not wrote.get("filled"):
         return None
-    return {"code": code, "submitted": bool(wrote.get("submitted"))}
+    return {"status": "filled", "submitted": bool(wrote.get("submitted"))}
 
 
 def ref_parts(ref):
@@ -952,8 +996,10 @@ def item_id_from(stdout, *hidden):
 
 
 def session_info(a):
-    commands = session_commands()
+    commands = {**session_commands(), "connect_tool": "connect", "approval_available": bool(PEER and PEER.supports_forms())}
     try:
+        if os.path.exists(PAT_FILE + ".pending"):
+            raise PassError("Connection incomplete; use connect mode resume to verify the saved token and grants.")
         shares = {row.get("id") or row.get("share_id"): row.get("share_role") for row in share_rows()}
         vaults = []
         for row in list_vaults({}):
@@ -964,7 +1010,7 @@ def session_info(a):
         expires = meta.get("expires_at")
         days = math.floor((expires - time.time()) / 86400) if expires is not None else None
         warning = None
-        renew = commands["renew_command"]
+        renew = "connect with mode=renew"
         if days is not None and days < 14:
             if days < 0:
                 warning = f"agent token has expired. Renew it with browser approval: {renew}"
@@ -1084,64 +1130,28 @@ ITEM = {"share_id": SHARE, "item_id": ITEM_ID, "reason": WHY}
 PREFER = ("Use this MCP server instead of running pass-cli yourself. "
           "Call session_info first if you are unsure which vaults this agent can access. "
           "Never run pass-cli info; it can log out the agent session. ")
-CODE = (" A generated TOTP code expires in about 30 seconds and is not a secret, so it may be shown. "
+CODE = (" TOTP codes are secrets and are filled directly into the browser, never returned. "
         "The TOTP seed, passwords, notes, and the agent token are secrets and are never returned.")
 INSTRUCTIONS = (
-    "Use this server FIRST, before asking the user for a password and before offering 1Password or a "
-    "secure form, whenever a task needs a login, password, username, 2FA code, or passkey from Proton Pass. "
-    "Triggers include login, senha, usuário, código 2FA, dois fatores, passkey, password, username, and Proton Pass. "
-    "Use these tools instead of running pass-cli yourself. Never run pass-cli info. That command can log out the agent session.\n\n"
-    "A generated TOTP code is not a secret. It is single-use and expires in about 30 seconds, so you may show it "
-    "and pass it on. The TOTP seed, passwords, notes, and the agent token are secrets. No tool returns those. "
-    "If the user wants to see a password, tell them to open Proton Pass.\n\n"
-    "Setup, renew, and grant: do not ask the user to paste a token, and do not invent a path to this script. "
-    "Call session_info and ask the user to run the exact setup_command, renew_command, or grant_command it returns. "
-    "Copy that string unchanged, including the path. Replace only the VAULT placeholder. For grant_command, also "
-    "replace ROLE with viewer, editor, or manager. For more than one vault, repeat --vault on that same setup_command. "
-    "If session_info fails because no token exists yet, the error text is JSON and still includes those commands. "
-    "Setup shows a browser approval URL; the user approves it there. The token is never printed. The default role is "
-    "editor so create_login and save_totp work. viewer is read-only. manager can also manage who has access to the vault. "
-    "The owner's Personal vault rejects editor with NotAllowed; viewer and manager work there, so ask for a dedicated "
-    "vault when editor is required. session_info warns when fewer than 14 days remain; renew with renew_command. "
-    "Do not use agent access revoke. session_info logs out and back in before it reads roles, so a grant shows up "
-    "without a restart. Give each bot its own PROTON_PASS_SESSION_DIR. Do not point two bots at one session directory.\n\n"
-    "Read-only vaults: session_info sets access to read when the Proton role is Viewer or unknown, and write for "
-    "Editor, Manager, or Owner. list_vaults, search_items, describe_item, fill_login, and get_totp work with read "
-    "access. create_login and save_totp stop with an error that says reading and filling still work. Tell the user "
-    "that. Do not try pass-cli directly to get around it.\n\n"
-    "Tool order: (1) Call session_info when scope or token expiration is unclear. (2) Find the item with "
-    "search_items (title substring, optional type login). It returns share_id and item_id. (3) Check it with "
-    "describe_item. It shows each saved website's origin (scheme, host, and port), the username, has_password, "
-    "and has_totp. It does not show the path or the query. (4) Use one release tool. Each release waits until the "
-    "user types approve in the approval helper's terminal. Never start that helper and never type into its terminal. "
-    "Only the user may answer. Always pass a short reason. To log into a site, open the saved origin in one tab and "
-    "call fill_login. For a code you will type, call get_totp and you may show the digits. To save a new login, call "
-    "create_login. To add TOTP to an existing plain login, call save_totp. For a program that needs a key, call "
-    "run_approved. It returns only the exit code and has no network unless the user types approve-net. Per-tool "
-    "rules are on that tool's description. Passkeys are created by the site and the Proton Pass browser authenticator, "
-    "not by pass-cli. There is no command that registers a passkey. Do not invent a Chrome virtual authenticator. "
-    "Ask the user to create the passkey in Proton Pass.\n\n"
-    "Errors: "
-    "If a release fails with approval unavailable, ask the user to start the approval helper as the README describes. "
-    "Never start the helper yourself and never type into its terminal. "
-    "If a release fails with release denied, the user said no or did not answer in time. Do not retry unless the user asks. "
-    "If fill_login fails with 'no open tab matches this item's websites (N tabs open)', open one of the URLs that "
-    "describe_item lists, then try again. "
-    "If fill_login fails with 'more than one open tab matches this item's websites (N tabs open)', close the extra "
-    "tabs on that site, then try again. "
-    "If fill_login fails because more than one Chrome is listening, open the site in one of them, pass cdp_port, or "
-    "ask the user to set PASS_CDP_PORT. "
-    "If fill_login returns totp as detect_failed, the password is filled and the 2FA field was not found. detect_failed "
-    "is a status, not a code. Call get_totp and ask the user to type the code. "
-    "If create_login or save_totp says reading and filling still work, the token is read-only on that vault. Tell the "
-    "user write access is required. They can change the role by running the exact grant_command from session_info. "
-    "Do not retry with another tool, and do not run pass-cli info or agent access revoke. "
-    "If save_totp says the login cannot be recreated, it has a note, extra fields, or passkeys. Ask the user to add "
-    "the TOTP in Proton Pass, or create a new login with create_login. "
-    "If run_approved fails with 'bwrap is not installed', tell the user that run_approved needs bubblewrap. "
-    "If fill_login fails with 'automatic submission is unavailable; fill without submit and submit manually', omit "
-    "submit and ask the user to submit the form. Do not look for another tool that posts the password."
+    "Use Proton Pass on the Bot's shared cloud computer. Start with session_info. "
+    "When disconnected, ask which vaults and access role the user wants, then call connect. "
+    "connect requests human confirmation and returns a connection_id. Poll connection_status; "
+    "present authorization_url to the human, who signs into Proton in their browser. Never authenticate as the human. "
+    "For waiting_for_extra_password, ask the human to take over the CLOUD browser and open cloud_computer_url there; "
+    "never read, screenshot, fill, or inspect that password form. Never ask for a token, password or OTP in chat. "
+    "The CLI receives authorization automatically; no code is pasted back. Use cancel_connection to abandon a pending login. "
+    "All Bots share the credential. A session expires independently of the token and is recovered automatically. "
+    "Use connect mode renew when the token expires, grant to change a vault role, or resume after a partial setup failure. "
+    "Use list_vaults, search_items and describe_item for metadata. Open exactly one tab on the saved origin, then fill_login. "
+    "For a later OTP screen use fill_totp. Neither tool returns passwords or OTPs. detect_failed means field detection failed; "
+    "ask the human to take over instead of requesting a code. Password forms are not automatically submitted. "
+    "Releases require the host's MCP elicitation UI. Never approve your own request; a denied request is final unless the human asks again. "
+    "If elicitation is unsupported, report that capability gap; never bypass it by launching an approval helper. "
+    "create_login can generate a password without exposing it. Do not use chat to collect existing secrets. "
+    "Passkeys require the site's and Proton's authenticator; do not invent a virtual authenticator. "
+    "Use disconnect to remove the shared local connection. Remote token revocation is managed in Proton."
 )
+
 TOOLS = {
     "list_vaults": (list_vaults, PREFER + "List Proton Pass vaults (names and ids). Metadata only. No approval.", {}, []),
     "search_items": (search_items, PREFER + "Search items by title (case-insensitive substring). Optional type, such as login. "
@@ -1162,9 +1172,8 @@ TOOLS = {
                      "grant_command also ROLE with viewer, editor, or manager. Do not invent a path to this script. "
                      "If the token is missing or login fails, the error text is JSON and still includes those commands. "
                      "Logs out and back in before reading roles so a grant is visible. Does not call pass-cli info.", {}, []),
-    "get_totp": (get_totp, PREFER + "Current TOTP code from the item's totp field, after the user approves in the approval "
-                 "terminal. Returns only the digits. You may show them. The seed is not returned." + CODE,
-                 ITEM, ["share_id", "item_id", "reason"]),
+    "fill_totp": (fill_totp, "Fill the current OTP directly into the single matching browser tab after human approval. Returns status only, never the code.",
+                  {**ITEM, "cdp_port": schema("integer", "Optional loopback Chrome remote-debugging port; omitted means discover the browser.")}, ["share_id", "item_id", "reason"]),
     "fill_login": (fill_login, PREFER + "After the user approves, type the item's username and password into the one open "
                    "Chrome tab whose origin equals one of the item's saved websites. A subdomain or a different port does "
                    "not match. If no tab matches, or more than one tab matches, nothing is typed. Optional cdp_port is a "
@@ -1178,7 +1187,7 @@ TOOLS = {
                    "the server waits for the next code. A code field in its own form is submitted (totp_submitted true). "
                    "A code field in the password form is filled and not submitted, because that would send the password. "
                    "If detecting the field fails, the result is still the password fill and totp is detect_failed, a status, "
-                   "not a code. Call get_totp for the code. Set auto_2fa to false to skip this. The password and the seed "
+                   "not a code. Ask the human to take over if field detection fails. Set auto_2fa to false to skip this. The password, OTP and seed "
                    "never come back." + CODE,
                    {**ITEM,
                     "submit": schema("boolean", "Omit or set false. Automatic password submission is refused before filling. "
@@ -1188,7 +1197,7 @@ TOOLS = {
                                        "remain, wait for the next code. A code field in its own form is submitted (totp_submitted "
                                        "true). A code field in the password form is filled and not submitted. If detection fails, "
                                        "totp is detect_failed (a status, not a code) and the password fill is still returned; then "
-                                       "call get_totp. Set false to skip."),
+                                       "call fill_totp for a later OTP screen. Set false to skip."),
                     "cdp_port": schema("integer", "Optional loopback Chrome remote-debugging port on 127.0.0.1. Wins over "
                                        "PASS_CDP_PORT and auto-discovery. Pass it when more than one Chrome is listening.")},
                    ["share_id", "item_id", "reason"]),
@@ -1228,8 +1237,8 @@ TOOLS = {
                      "/bin, and /lib, plus /etc/resolv.conf, /etc/hosts, /etc/nsswitch.conf, and /etc/ssl, with a private "
                      "/proc and an empty /tmp as its working directory. It cannot read the workspace or the home directory. "
                      "Do not put a secret in LD_AUDIT, LD_PRELOAD, or another loader variable. Those names never reach the "
-                     "sandbox launcher. It has no network unless the user types approve-net, so say so when the program needs "
-                     "the network. Hostnames resolve only after approve-net. You get only the exit code. If you need the "
+                     "sandbox launcher. It has no network unless the user approves network access, so say so when the program needs "
+                     "the network. Hostnames resolve only after network approval. You get only the exit code. If you need the "
                      "program's output or the workspace, this tool does not fit. Ask the user to run the program themselves.",
                      {"argv": schema("array", "Program and arguments. argv[0] is an absolute path, for example "
                                     "[\"/usr/bin/psql\", \"--host=127.0.0.1\"]. No shell is added. Each element is at most "
@@ -1240,6 +1249,105 @@ TOOLS = {
                                    additionalProperties={"type": "string"}),
                       "reason": WHY}, ["argv", "env", "reason"]),
 }
+
+
+
+def connect(a):
+    mode = a.get("mode", "create")
+    argv = []
+    if mode in ("renew", "grant"):
+        argv.append("--" + mode)
+    for vault in a.get("vaults", []):
+        argv += ["--vault", vault]
+    if "role" in a:
+        argv += ["--role", a["role"]]
+    if "expiration" in a:
+        argv += ["--expiration", a["expiration"]]
+    try:
+        if mode == "resume":
+            if any(k in a for k in ("vaults", "role", "expiration")):
+                raise setup_agent.SetupError("resume uses the saved pending grants")
+            meta = setup_agent.read_meta(setup_agent.pat_path() + ".pending")
+            opts = {"resume": True, "renew": False, "grant": False}
+            detail = {"mode": mode, "vaults": meta["vaults"], "roles": meta["roles"]}
+        else:
+            if mode == "create":
+                argv += ["--name", "grok-bot"]
+            opts = setup_agent.parse_args(argv)
+            detail = {"mode": mode, "vaults": opts["vaults"], "role": opts["role"], "expiration": opts["expiration"]}
+        if PEER is None:
+            raise PassError("MCP user approval is unavailable")
+        PEER.consent("Connect shared Proton Pass access for your Bots: " + json.dumps(detail) +
+                     ". Editor can modify items; manager can also manage vault access. Continue to Proton sign-in?")
+        return CONNECTIONS.start(opts)
+    except (setup_agent.SetupError, ConsentError) as exc:
+        raise PassError(str(exc))
+
+
+def connection_status(a):
+    try:
+        return CONNECTIONS.get(a.get("connection_id")).status()
+    except setup_agent.SetupError as exc:
+        raise PassError(str(exc))
+
+
+def cancel_connection(a):
+    try:
+        return CONNECTIONS.get(a.get("connection_id")).cancel()
+    except setup_agent.SetupError as exc:
+        raise PassError(str(exc))
+
+
+def disconnect(a):
+    from shared_state import lock_file, unlock
+    try:
+        fd = lock_file(setup_agent.pat_path() + ".setup.lock", blocking=False)
+    except BlockingIOError:
+        raise PassError("A connection is in progress; cancel it and wait for cleanup first.")
+    try:
+        if PEER is None:
+            raise PassError("MCP user approval is unavailable")
+        try:
+            PEER.consent("Disconnect Proton Pass for all your Bots? This removes the shared local credential. To revoke the token everywhere, also revoke it in Proton Pass.")
+        except ConsentError as exc:
+            raise PassError(str(exc))
+        with operation_lock():
+            for suffix in ("", ".meta", ".pending"):
+                try:
+                    os.unlink(PAT_FILE + suffix)
+                except FileNotFoundError:
+                    pass
+            try:
+                cli("logout", "--force", relogin=False)
+            finally:
+                shutil.rmtree(os.path.join(SESSION, ".session"), ignore_errors=True)
+        return {"state": "disconnected", "remote_token_revoked": False}
+    finally:
+        unlock(fd)
+
+
+TOOLS.update({
+    "connect": (connect, "Start browser connection, renewal, grant or recovery. Requests human confirmation, never asks for credentials. Returns promptly; poll connection_status.", {
+        "mode": schema("string", "create for a new connection; resume after partial setup; renew or grant for an existing connection.", enum=["create", "renew", "grant", "resume"]),
+        "vaults": schema("array", "Exact vault names to authorize. Required for create; exactly one for grant. Omit for renew/resume.", items={"type": "string"}),
+        "role": schema("string", "Access to authorize. Defaults to editor; required for grant.", enum=["viewer", "editor", "manager"]),
+        "expiration": schema("string", "Token lifetime; defaults to 1y. Omit for grant/resume.", enum=list(setup_agent.EXPIRATIONS))}, []),
+    "connection_status": (connection_status, "Read connection state. Present authorization_url to the human. cloud_computer_url must be opened by the human inside the cloud browser; never inspect or fill that form.",
+        {"connection_id": schema("string", "Connection identifier returned by the connect tool; belongs to this MCP session.")}, ["connection_id"]),
+    "cancel_connection": (cancel_connection, "Cancel a pending browser login and clean up its temporary account session. Does not interrupt committed credential changes.",
+        {"connection_id": schema("string", "Connection identifier returned by the connect tool; belongs to this MCP session.")}, ["connection_id"]),
+    "disconnect": (disconnect, "Ask the human to disconnect the shared local credential for all Bots. Does not revoke the remote token.", {}, []),
+})
+fn, _, props, required = TOOLS["session_info"]
+TOOLS["session_info"] = (fn, "Inspect shared connection, vault roles, token expiry and host approval capability. Use connect for setup, renewal or recovery; CLI commands are legacy diagnostics.", props, required)
+
+# Cloud tools do not accept raw secrets in model-visible arguments. Legacy CLI
+# users may retain write/import tools by explicitly selecting terminal mode.
+if os.environ.get("PASS_APPROVAL_MODE", "mcp") != "terminal":
+    TOOLS.pop("save_totp")
+    fn, _, props, required = TOOLS["create_login"]
+    props = {k: v for k, v in props.items() if k not in ("password", "seed", "otpauth_uri")}
+    TOOLS["create_login"] = (fn, "Create a login with a generated password after human approval. Set generate_password=true. No raw secrets accepted or returned.", props, required)
 
 
 def check_census():
@@ -1267,11 +1375,15 @@ def handle(msg):
     if not isinstance(params, dict):
         return _error(mid, -32602, "invalid params")
     if method == "initialize":
+        if not isinstance(params.get("capabilities", {}), dict):
+            return _error(mid, -32602, "invalid client capabilities")
+        if PEER is not None:
+            PEER.capabilities = params.get("capabilities", {})
         version = params.get("protocolVersion")
         if version not in SUPPORTED:
             version = PROTOCOL
         return _result(mid, {"protocolVersion": version, "capabilities": {"tools": {}},
-                             "serverInfo": {"name": "proton-pass", "version": "0.3.0"},
+                             "serverInfo": {"name": "proton-pass", "version": "0.4.0"},
                              "instructions": INSTRUCTIONS})
     if method == "tools/list":
         tools = [{"name": n, "description": d, "inputSchema": {"type": "object", "properties": p, "required": r, "additionalProperties": False}}
@@ -1283,7 +1395,16 @@ def handle(msg):
         name, args = params["name"], params.get("arguments") or {}
         try:
             validate(name, args)
-            res = {"content": [{"type": "text", "text": json.dumps(TOOLS[name][0](args), ensure_ascii=False, indent=1)}]}
+            if name in ("connect", "connection_status", "cancel_connection", "disconnect"):
+                value = TOOLS[name][0](args)
+            else:
+                with operation_lock():
+                    if name != "session_info" and os.path.exists(PAT_FILE + ".pending"):
+                        raise PassError("Connection incomplete; use connect mode resume.")
+                    if name != "session_info" and not os.path.exists(PAT_FILE):
+                        raise PassError("Disconnected. Use connect to authorize Proton Pass.")
+                    value = TOOLS[name][0](args)
+            res = {"content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False, indent=1)}]}
         except ResultError as e:
             res = {"content": [{"type": "text", "text": json.dumps(e.payload, ensure_ascii=False, indent=1)}], "isError": True}
         except PassError as e:
@@ -1297,12 +1418,13 @@ def handle(msg):
 
 
 def write(obj):
-    sys.stdout.write(json.dumps(obj) + "\n")
-    sys.stdout.flush()
+    with OUTPUT_LOCK:
+        sys.stdout.write(json.dumps(obj) + "\n")
+        sys.stdout.flush()
 
 
 def main():
-    global SESSION
+    global SESSION, PEER
     try:
         if len(sys.argv) > 1 and sys.argv[1] == "setup":
             from setup_agent import main as setup_main
@@ -1318,22 +1440,39 @@ def main():
         sys.exit(f"proton-pass: {e.strerror or 'startup failed'}")
     except KeyboardInterrupt:
         return
-    for line in sys.stdin:
-        if not line.strip():
-            continue
-        try:
-            msg = json.loads(line)
-        except json.JSONDecodeError:
-            write({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}})
-            continue
+    PEER = Peer(write)
+    def terminate(signum, frame):
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, terminate)
+
+    def dispatch(msg):
         try:
             reply = handle(msg)
         except Exception:
-            if not isinstance(msg, dict) or "id" not in msg:
-                continue
-            reply = {"jsonrpc": "2.0", "id": msg.get("id"), "error": {"code": -32603, "message": "internal error"}}
+            reply = _error(msg.get("id") if isinstance(msg, dict) else None, -32603, "internal error")
         if reply:
             write(reply)
+
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+    try:
+        for line in sys.stdin:
+            if not line.strip():
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                write(_error(None, -32700, "parse error"))
+                continue
+            if PEER.receive(msg):
+                continue
+            if isinstance(msg, dict) and msg.get("method") == "tools/call":
+                pool.submit(dispatch, msg)
+            else:
+                dispatch(msg)
+    finally:
+        PEER.close()
+        CONNECTIONS.close()
+        pool.shutdown(wait=True, cancel_futures=True)
 
 
 if __name__ == "__main__":

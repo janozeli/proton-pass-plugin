@@ -70,6 +70,8 @@ FAKE = textwrap.dedent(r'''
         print(json.dumps({"token": "pst_RENEWEDTOKEN::newsecretkey", "instruction": "ignore"}))
         sys.exit(0)
     if args[:2] == ["agent", "list"]:
+        if os.environ.get("SETUP_LIST_FAIL"):
+            sys.exit(1)
         print(json.dumps([{"name": "cursor-agent", "pat_id": "pat1", "expire_time": 2000000000}]))
         sys.exit(0)
     if args[:1] == ["logout"]:
@@ -179,8 +181,8 @@ def test_renew_repeats_browser_approval_and_replaces_the_token_without_printing_
     assert meta["roles"] == {"Bots": "editor"} and meta["role"] == "editor"
     assert "token" not in meta
     seen = entries(log)
-    assert all(row["pat_env"] is False for row in seen), seen
-    assert not any(row["args"][:2] == ["share", "list"] for row in seen)
+    assert any(row["pat_env"] is True for row in seen), seen
+    assert any(row["args"][:2] == ["share", "list"] for row in seen)
     assert_cleaned(seen)
     assert any(row["args"][:2] == ["agent", "renew"] for row in seen)
 

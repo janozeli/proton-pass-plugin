@@ -141,6 +141,13 @@ def test_matching_origin_wins_and_a_tie_lists_ports_without_urls():
         second.shutdown()
 
 
+
+def test_chromium_rewritten_process_title_is_discovered():
+    from cdp_discover import ports_from_cmdline
+    assert ports_from_cmdline(b"/opt/chrome --headless --remote-debugging-port=54321 --user-data-dir=/tmp/test\0") == [54321]
+    assert ports_from_cmdline(b"/opt/chrome\0--remote-debugging-port=54321\0") == [54321]
+    assert ports_from_cmdline(b"/opt/chrome --remote-debugging-port=123abc\0") == []
+
 if __name__ == "__main__":
     tests = [value for name, value in list(globals().items()) if name.startswith("test_")]
     failed = 0

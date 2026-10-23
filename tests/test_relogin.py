@@ -18,8 +18,8 @@ echo '{{"vaults":[{{"name":"V","vault_id":"v","share_id":"s"}}]}}'
     calls = open(f"{d}/calls").read().split("\n")
     assert [l.split()[0] for l in calls if l] == ["vault", "login", "vault"], calls
     tools = [t["name"] for t in c.rpc("tools/list")["tools"]]
-    assert tools == ["list_vaults", "search_items", "describe_item", "session_info", "get_totp",
-                     "fill_login", "create_login", "save_totp", "run_approved"], tools
+    assert tools == ["list_vaults", "search_items", "describe_item", "session_info", "fill_totp",
+                     "fill_login", "create_login", "run_approved", "connect", "connection_status", "cancel_connection", "disconnect"], tools
     c.close()
     print("test_relogin_on_expired_session OK; call sequence:", [l.split()[0] for l in calls if l])
 
