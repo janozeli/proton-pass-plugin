@@ -1,5 +1,5 @@
-import json, os, re, time
-from harness import PASSWORD, SERVER, Operator, calls, error, session, start, write
+import json, os, re, shlex, time
+from harness import PASSWORD, ROOT, SERVER, Operator, calls, error, session, start, write
 
 
 def logins(d):
@@ -39,6 +39,31 @@ def test_session_info_never_calls_info_and_the_session_still_works():
         assert logins(d) == [["login"]], calls(d)
         text = open(SERVER).read() + open(os.path.join(os.path.dirname(SERVER), "setup_agent.py")).read()
         assert not re.search(r"""cli(?:_json)?\(\s*["']info["']""", text)
+    finally:
+        c.close()
+
+
+def test_session_info_commands_use_this_script_and_the_skill_has_no_install_path():
+    d, c = start()
+    try:
+        info = c.call("session_info")
+        script = os.path.abspath(SERVER)
+        quoted = shlex.quote(script)
+        assert info["setup_command"] == f'python3 {quoted} setup --vault "VAULT" --name cursor-agent', info
+        assert info["renew_command"] == f"python3 {quoted} setup --renew", info
+        assert info["grant_command"] == f'python3 {quoted} setup --grant --vault "VAULT" --role ROLE', info
+        for key in ("setup_command", "renew_command", "grant_command"):
+            assert script in info[key], info[key]
+            assert "~/.cursor/plugins/local" not in info[key]
+        skill = open(os.path.join(ROOT, "skills", "proton-pass", "SKILL.md")).read()
+        assert "~/.cursor/plugins/local" not in skill
+        assert "setup_command" in skill and "renew_command" in skill and "grant_command" in skill
+        os.remove(os.path.join(d, "pat"))
+        failed = json.loads(error(c, "session_info"))
+        assert failed["error"] == "PAT file cannot be read", failed
+        assert failed["setup_command"] == info["setup_command"], failed
+        assert failed["renew_command"] == info["renew_command"] and failed["grant_command"] == info["grant_command"]
+        assert "~/.cursor/plugins/local" not in json.dumps(failed)
     finally:
         c.close()
 

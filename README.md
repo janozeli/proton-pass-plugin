@@ -24,26 +24,32 @@ Public `pass-cli login` with no flags is web login, from the [login command](htt
 
 After those grants, setup logs in with the new agent token in a second temporary directory (mode 0700), runs `share list --only-vaults=true --output json`, and checks that each vault's `share_role` matches the requested role, ignoring case. The same check runs for `setup --grant`. If a role does not match, setup exits with an error and does not update `pat.meta`. The token from `agent create` is still saved, because pass-cli shows it only once. Both the full-account directory and the verification directory are logged out with `--force` and deleted, including when setup fails.
 
+From the plugin directory (the directory that contains `server/`), the first setup looks like this:
+
 ```bash
-python3 ~/.cursor/plugins/local/proton-pass/server/proton_pass_mcp.py setup --vault "Bots" --name cursor-agent
+python3 server/proton_pass_mcp.py setup --vault "Bots" --name cursor-agent
 ```
+
+Once the server is running, call `session_info` and use the `setup_command`, `renew_command`, and `grant_command` it returns. Each one is `python3` plus the absolute path of the running `proton_pass_mcp.py`. A local Cursor copy lives under `~/.cursor/plugins/local/proton-pass` after the install step above. Other hosts install the plugin somewhere else. Use the commands from `session_info` instead of guessing that path. If `session_info` fails because no token exists yet, the error text is JSON and still includes `setup_command`.
 
 Repeat `--vault` for more than one vault. `--expiration` defaults to `1y`. The PAT file is `~/.config/pass-agent/pat` (mode 0600). A sidecar `pat.meta` (mode 0600) stores the agent name, vaults, per-vault `roles`, and expiration timestamp. It does not store the token. `role` is also set when every vault has the same role. The server refuses a token file that the group or other users can access, a symlink, or a file another user owns. Metadata with any of those problems is ignored, so `session_info` reports no expiration.
 
 The temporary directory is deleted after `pass-cli logout` and `logout --force`. The plugin's own `PROTON_PASS_SESSION_DIR` is a different directory and holds only the agent login.
 
-When fewer than 14 days remain, `session_info` warns. Renewing repeats the browser approval. `agent renew` replaces the token immediately and keeps the existing grants:
+When fewer than 14 days remain, `session_info` warns and includes `renew_command`. Renewing repeats the browser approval. `agent renew` replaces the token immediately and keeps the existing grants. From the plugin directory, or by running the exact `renew_command` from `session_info`:
 
 ```bash
-python3 ~/.cursor/plugins/local/proton-pass/server/proton_pass_mcp.py setup --renew
+python3 server/proton_pass_mcp.py setup --renew
 ```
 
 `--renew` reads the agent name from `pat.meta` and cannot be combined with `--vault`. Pass `--expiration` to choose a new lifetime. The default is again `1y`.
 
 Changing a vault role repeats the browser approval and runs `agent access grant` for the agent name stored in `pat.meta`. It does not create a token. A second grant on a vault that already has access changes the role in place (`viewer` to `manager` and back). `agent access revoke --share-id` returned `NotExists` for both the owner share id and the agent share id, so setup does not revoke.
 
+From the plugin directory, or by running the exact `grant_command` from `session_info` (replace `VAULT` and `ROLE` only):
+
 ```bash
-python3 ~/.cursor/plugins/local/proton-pass/server/proton_pass_mcp.py setup --grant --vault "Bots" --role editor
+python3 server/proton_pass_mcp.py setup --grant --vault "Bots" --role editor
 ```
 
 `--grant` needs exactly one `--vault` and `--role viewer`, `editor`, or `manager`. It cannot be combined with `--name`, `--expiration`, or `--renew`. On success, `pat.meta` records that vault's new role.
@@ -52,14 +58,14 @@ The owner's primary vault named `Personal` rejects `--role editor` with `NotAllo
 
 A running server keeps the previous `share_role` in its session until it logs in again. `session_info` and the write check do that login themselves. A restart is not required. The server still never runs `pass-cli info`.
 
-A token file you created by hand still logs in. `session_info` then leaves `expires_at` null and does not warn, because no expiration was recorded. Use `setup` so the warning and the renew command exist.
+A token file you created by hand still logs in. `session_info` then leaves `expires_at` null and does not warn, because no expiration was recorded. Use `setup` so the warning and `renew_command` exist. The same report includes `setup_command` and `grant_command`.
 
 ## Start the approval helper
 
-Run the helper in a terminal that you keep open:
+Run the helper in a terminal that you keep open, from the plugin directory:
 
 ```bash
-python3 ~/.cursor/plugins/local/proton-pass/server/proton_pass_mcp.py approve
+python3 server/proton_pass_mcp.py approve
 ```
 
 The helper listens on `approve.sock` in the session directory. It reads your answer from its own terminal (`/dev/tty`), not from a pipe. For each request it prints the item title, the exact origin, the write change, or the exact argv, and the agent's reason. A write request shows `create login` or `attach TOTP by replacing the login`. It does not show the password or the TOTP seed.
@@ -100,7 +106,7 @@ Set a variable in `mcp.json` under `mcpServers.proton-pass.env` when a default i
 | `list_vaults` | No | Vault names and ids |
 | `search_items` | No | Title, type, vault, `share_id`, `item_id`. Trashed items are omitted |
 | `describe_item` | No | Origins (scheme, host, and port), username, email, and booleans for password, TOTP, and note. No path, query, or fragment |
-| `session_info` | No | Agent-token identity, name, each vault's role and `read` or `write` access, `expires_at`, `days_remaining`, and a warning when fewer than 14 days remain. Includes `renew_command`. Logs out and back in before reading roles. Does not call `pass-cli info` |
+| `session_info` | No | Agent-token identity, name, each vault's role and `read` or `write` access, `expires_at`, `days_remaining`, and a warning when fewer than 14 days remain. Includes `setup_command`, `renew_command`, and `grant_command`, each `python3` plus this server's absolute path. If login fails, the error text is JSON and still includes those commands. Logs out and back in before reading roles. Does not call `pass-cli info` |
 | `get_totp` | Yes | `{"code": "123456"}`. The code is not a secret. The seed is not returned |
 | `fill_login` | Yes | `{"filled": ["username", "password"], "submitted": false}`. When a 2FA field was filled, `filled` also contains `"totp"`, plus `"totp"` (the code) and `"totp_submitted"`. If 2FA field detection fails, `"totp"` is `"detect_failed"` and the password fill is still returned. No URL, password, or seed |
 | `create_login` | Yes | `{"item_id": "..."}`. The password and any seed are stored and not returned |
@@ -141,7 +147,7 @@ Offline tests use a fake `pass-cli` that resolves `pass://` values and execs the
 for test in tests/test_*.py; do python3 "$test"; done
 ```
 
-`test_totp.py` checks RFC 6238 vectors, including the wait when fewer than 3 seconds remain. `test_discover.py` checks command-line and `DevToolsActivePort` parsing, an explicit `PASS_CDP_PORT`, a `cdp_port` argument that wins over both, origin matching, and rejection of a websocket host other than `127.0.0.1`. `test_setup.py` uses a fake `pass-cli`: the approval URL is printed, a parent `PROTON_PASS_PERSONAL_ACCESS_TOKEN` is not forwarded, the PAT file receives only the agent token (mode 0600), `agent create` is not given `--vault`, the grant uses the requested role, create and `setup --grant` check `share_role` with a fresh agent login (a capitalized role still matches), a mismatched role fails without updating `pat.meta`, `NotAllowed` for `editor` names the Personal-vault limit, renew replaces the token, no token value is printed, `pass-cli info` is not called, and both session directories are removed on success and on failure. `test_write.py` checks that a stale cached `share_role` is refreshed by logout and login before `session_info` or a write, without calling `pass-cli info` and without deleting the session directory. `test_write.py` checks that `session_info` warns below 14 days, ignores metadata that is not private, still works after the report (the fake `info` command would have logged the session out), refuses a Viewer token before any write, waits for approval before `create_login` or `save_totp`, and that a failed delete either removes the new item or returns both ids. `test_fill.py` includes a headless Chrome on a port other than 9222 with `PASS_CDP_PORT` unset, a `cdp_port` argument that wins over `PASS_CDP_PORT`, a separate 2FA form that is submitted, a 2FA field inside the password form that is filled and not submitted, and a 2FA detection failure reported as `totp: detect_failed`.
+`test_totp.py` checks RFC 6238 vectors, including the wait when fewer than 3 seconds remain. `test_discover.py` checks command-line and `DevToolsActivePort` parsing, an explicit `PASS_CDP_PORT`, a `cdp_port` argument that wins over both, origin matching, and rejection of a websocket host other than `127.0.0.1`. `test_setup.py` uses a fake `pass-cli`: the approval URL is printed, a parent `PROTON_PASS_PERSONAL_ACCESS_TOKEN` is not forwarded, the PAT file receives only the agent token (mode 0600), `agent create` is not given `--vault`, the grant uses the requested role, create and `setup --grant` check `share_role` with a fresh agent login (a capitalized role still matches), a mismatched role fails without updating `pat.meta`, `NotAllowed` for `editor` names the Personal-vault limit, renew replaces the token, no token value is printed, `pass-cli info` is not called, and both session directories are removed on success and on failure. `test_write.py` checks that a stale cached `share_role` is refreshed by logout and login before `session_info` or a write, without calling `pass-cli info` and without deleting the session directory. `test_write.py` checks that `session_info` warns below 14 days, ignores metadata that is not private, still works after the report (the fake `info` command would have logged the session out), returns `setup_command`, `renew_command`, and `grant_command` with the running script's absolute path (including when the token file is missing), that the skill contains no local plugin path, refuses a Viewer token before any write, waits for approval before `create_login` or `save_totp`, and that a failed delete either removes the new item or returns both ids. `test_fill.py` includes a headless Chrome on a port other than 9222 with `PASS_CDP_PORT` unset, a `cdp_port` argument that wins over `PASS_CDP_PORT`, a separate 2FA form that is submitted, a 2FA field inside the password form that is filled and not submitted, and a 2FA detection failure reported as `totp: detect_failed`.
 
 These tests do not talk to Proton. A real account is still required to confirm that the printed web-login URL completes, that the extra-password prompt accepts the Proton Pass extra password when the account has one, that `agent create`, `agent access grant`, `agent renew`, and `agent list` succeed against the vault, that the written token logs in, and that `fill_login` types into a real item. `tests/e2e_real.py` covers a logged-in vault for `list_vaults`, `search_items`, `describe_item`, `run_approved`, and `get_totp`. It answers approvals itself and prints no secret values. It needs the token file, `pass-cli`, and `bwrap`. It does not run the browser login or `fill_login`. CI runs the offline tests only.
 
