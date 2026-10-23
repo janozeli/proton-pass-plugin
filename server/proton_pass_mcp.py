@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import ipaddress, json, math, os, re, resource, secrets, shutil, signal, select, socket, stat, struct, subprocess, sys, termios, time, unicodedata
+import ipaddress, json, math, os, re, resource, secrets, shutil, signal, select, shlex, socket, stat, struct, subprocess, sys, termios, time, unicodedata
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 import idna
@@ -822,8 +822,28 @@ def meta_file():
     return PAT_FILE + ".meta"
 
 
+def server_script():
+    return shlex.quote(os.path.abspath(__file__))
+
+
+def setup_command():
+    return f'python3 {server_script()} setup --vault "VAULT" --name cursor-agent'
+
+
 def renew_command():
-    return f"python3 {os.path.abspath(__file__)} setup --renew"
+    return f"python3 {server_script()} setup --renew"
+
+
+def grant_command():
+    return f'python3 {server_script()} setup --grant --vault "VAULT" --role ROLE'
+
+
+def session_commands():
+    return {
+        "setup_command": setup_command(),
+        "renew_command": renew_command(),
+        "grant_command": grant_command(),
+    }
 
 
 def read_public_meta():
@@ -932,34 +952,40 @@ def item_id_from(stdout, *hidden):
 
 
 def session_info(a):
-    shares = {row.get("id") or row.get("share_id"): row.get("share_role") for row in share_rows()}
-    vaults = []
-    for row in list_vaults({}):
-        access, label = access_of(shares.get(row.get("share_id")))
-        vaults.append({"name": row.get("name"), "vault_id": row.get("vault_id"), "share_id": row.get("share_id"),
-                       "role": label, "access": access})
-    meta = read_public_meta()
-    expires = meta.get("expires_at")
-    days = math.floor((expires - time.time()) / 86400) if expires is not None else None
-    warning = None
-    renew = renew_command()
-    if days is not None and days < 14:
-        if days < 0:
-            warning = f"agent token has expired. Renew it with browser approval: {renew}"
-        else:
-            warning = f"agent token expires in {days} days. Renew it with browser approval: {renew}"
-    return {
-        "identity_type": "agent_token",
-        "name": meta.get("name"),
-        "vaults": vaults,
-        "can_write": any(row["access"] == "write" for row in vaults),
-        "expires_at": datetime.fromtimestamp(expires, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if expires is not None else None,
-        "expires_at_unix": expires,
-        "days_remaining": days,
-        "expiration_warning": days is not None and days < 14,
-        "warning": warning,
-        "renew_command": renew,
-    }
+    commands = session_commands()
+    try:
+        shares = {row.get("id") or row.get("share_id"): row.get("share_role") for row in share_rows()}
+        vaults = []
+        for row in list_vaults({}):
+            access, label = access_of(shares.get(row.get("share_id")))
+            vaults.append({"name": row.get("name"), "vault_id": row.get("vault_id"), "share_id": row.get("share_id"),
+                           "role": label, "access": access})
+        meta = read_public_meta()
+        expires = meta.get("expires_at")
+        days = math.floor((expires - time.time()) / 86400) if expires is not None else None
+        warning = None
+        renew = commands["renew_command"]
+        if days is not None and days < 14:
+            if days < 0:
+                warning = f"agent token has expired. Renew it with browser approval: {renew}"
+            else:
+                warning = f"agent token expires in {days} days. Renew it with browser approval: {renew}"
+        return {
+            "identity_type": "agent_token",
+            "name": meta.get("name"),
+            "vaults": vaults,
+            "can_write": any(row["access"] == "write" for row in vaults),
+            "expires_at": datetime.fromtimestamp(expires, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if expires is not None else None,
+            "expires_at_unix": expires,
+            "days_remaining": days,
+            "expiration_warning": days is not None and days < 14,
+            "warning": warning,
+            **commands,
+        }
+    except PassError as exc:
+        # A missing token is why setup has not been run yet. The script path is
+        # only known here, so the error still carries the absolute commands.
+        raise ResultError({**commands, "error": exc.args[0]})
 
 
 def create_login(a):
@@ -1057,7 +1083,7 @@ TOOLS = {
     "search_items": (search_items, PREFER + "Search items by title (case-insensitive substring). Metadata only, no secrets.",
                      {"query": S, "vault": S, "type": {"type": "string", "enum": ["login", "note", "alias", "credit-card", "identity", "ssh-key", "wifi", "custom"]}, "limit": {"type": "integer"}}, []),
     "describe_item": (describe_item, PREFER + "Item metadata: website origins (scheme, host, and port only), username, email, has_password, has_totp, extra field names. No path, query, fragment, or secret values.", ITEM, ["share_id", "item_id"]),
-    "session_info": (session_info, PREFER + "Read-only session report: agent-token identity, agent name, each vault's Proton role and read or write access, and the agent token expiration recorded by setup. Warns when fewer than 14 days remain and includes the renew command. Logs out and back in before reading roles so a grant is visible. Does not call pass-cli info.", {}, []),
+    "session_info": (session_info, PREFER + "Read-only session report: agent-token identity, agent name, each vault's Proton role and read or write access, and the agent token expiration recorded by setup. Warns when fewer than 14 days remain. Includes setup_command, renew_command, and grant_command, each python3 plus this server's absolute path. If the token is missing or login fails, the error text is JSON and still includes those commands. Logs out and back in before reading roles so a grant is visible. Does not call pass-cli info.", {}, []),
     "get_totp": (get_totp, PREFER + "Current TOTP code from the item's totp field, after the operator approves in the approval terminal. Returns only the digits." + CODE, ITEM, ["share_id", "item_id", "reason"]),
     "fill_login": (fill_login, PREFER + "After the operator approves, type the item's username and password into the one open Chrome tab whose origin equals one of the item's saved websites. Optional cdp_port is a loopback remote-debugging port and wins over PASS_CDP_PORT and auto-discovery. Otherwise PASS_CDP_PORT selects the browser, or the loopback Chrome whose open page matches the item is used, and several unmatched browsers are an error. The password never comes back. When auto_2fa is true (the default) and the page shows a TOTP field, the current code is typed too; a separate 2FA form is submitted, and the password form is not. If detecting that field fails, totp is detect_failed and the password fill is still returned. Set auto_2fa to false to skip that. Automatic password submission is refused: omit submit or set it to false. submitted is always false." + CODE,
                    {**ITEM, "submit": {"type": "boolean"}, "auto_2fa": {"type": "boolean", "description": "Type the current TOTP code when the page asks for one. Defaults to true."},
