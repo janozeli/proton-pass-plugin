@@ -82,6 +82,47 @@ def test_no_tool_takes_a_forbidden_parameter():
         c.close()
 
 
+def test_initialize_returns_usage_instructions():
+    d, c = start()
+    try:
+        c.send({"jsonrpc": "2.0", "id": 41, "method": "initialize",
+                "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t"}}})
+        text = c.read()["result"]["instructions"]
+        assert isinstance(text, str) and len(text.strip()) > 200, text
+        for needle in ("pass-cli info", "session_info", "fill_login", "setup_command", "renew_command",
+                       "grant_command", "not a secret", "reading and filling", "approval unavailable",
+                       "release denied", "detect_failed", "bwrap is not installed",
+                       "automatic submission is unavailable", "approve-net", "FIRST"):
+            assert needle in text, needle
+        assert "~/.cursor" not in text and "skills/" not in text
+        assert c.call("list_vaults")[0]["name"] == "V"
+    finally:
+        c.close()
+
+
+def test_every_tool_has_a_nontrivial_description():
+    d, c = start()
+    try:
+        tools = c.rpc("tools/list")["tools"]
+        assert [t["name"] for t in tools]
+        seen = set()
+        for tool in tools:
+            desc = tool["description"].strip()
+            assert len(desc) >= 80 and " " in desc, tool["name"]
+            assert desc not in seen, tool["name"]
+            seen.add(desc)
+            for key, prop in tool["inputSchema"]["properties"].items():
+                field = prop.get("description", "").strip()
+                assert len(field) >= 40, (tool["name"], key, field)
+        fill = next(t for t in tools if t["name"] == "fill_login")
+        assert "submit" in fill["description"] and "auto_2fa" in fill["description"]
+        assert "one open" in fill["description"]
+        run = next(t for t in tools if t["name"] == "run_approved")
+        assert "sandbox" in run["description"] and "approve-net" in run["description"]
+    finally:
+        c.close()
+
+
 def test_fill_login_rejects_url_match_and_selectors():
     d, c = start()
     try:
