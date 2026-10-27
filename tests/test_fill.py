@@ -791,7 +791,8 @@ def test_fill_does_not_submit_totp_inside_the_password_form(lab):
             got = c.call("fill_login", **ITEM)
             assert got["filled"] == ["username", "password", "totp"] and got["totp_submitted"] is False, got
             assert got["submitted"] is False and page.text_content("#result") == ""
-            assert value(page, "#pw") == PASSWORD and value(page, "#otp") == got["totp"]
+            assert value(page, "#pw") == PASSWORD and value(page, "#otp").isdigit()
+            assert got["totp"] == "filled" and value(page, "#otp") not in json.dumps(got)
             assert "SEEDSECRETVALUE" not in json.dumps(got)
     finally:
         op.close()
@@ -808,9 +809,10 @@ def test_fill_types_and_submits_a_separate_totp_form(lab):
             assert got["submitted"] is False and got["totp_submitted"] is True, got
             assert got["filled"] == ["username", "password", "totp"], got
             assert value(page, "#pw") == PASSWORD
-            assert value(page, "#otp") == got["totp"] == page.text_content("#result")
+            assert value(page, "#otp") == page.text_content("#result") and got["totp"] == "filled"
             now = time.time()
-            assert got["totp"] in {totp_at(OTP_URI, now), totp_at(OTP_URI, now + 3)}, got["totp"]
+            assert value(page, "#otp") in {totp_at(OTP_URI, now), totp_at(OTP_URI, now + 3)}
+            assert value(page, "#otp") not in json.dumps(got)
             assert "GEZDGNBVGY3TQOJQ" not in json.dumps(got)
     finally:
         op.close()
@@ -883,7 +885,7 @@ def test_fill_discovers_a_non_default_cdp_port_and_submits_totp(lab):
         page.goto(lab.good + "/otp.html")
         got = c.call("fill_login", **ITEM)
         assert got["submitted"] is False and got["totp_submitted"] is True, got
-        assert value(page, "#otp") == got["totp"] == page.text_content("#result")
+        assert value(page, "#otp") == page.text_content("#result") and got["totp"] == "filled"
         assert value(page, "#pw") == PASSWORD
         assert "GEZDGNBVGY3TQOJQ" not in json.dumps(got)
     finally:
@@ -891,6 +893,60 @@ def test_fill_discovers_a_non_default_cdp_port_and_submits_totp(lab):
         op.close()
         c.close()
 
+
+
+def test_fill_totp_on_a_later_page_returns_no_code(lab):
+    d, c = server(lab)
+    patch_totp(d)
+    op = Operator(d)
+    try:
+        with tab(lab, "/login.html") as page:
+            page.set_content('<form onsubmit="return false"><input id=otp autocomplete=one-time-code maxlength=6><button>Verify</button></form>')
+            got = c.call("fill_totp", **ITEM)
+            code = value(page, "#otp")
+            assert len(code) == 6 and code.isdigit()
+            assert got["filled"] == ["totp"] and got["totp"] == "filled"
+            assert code not in json.dumps(got) and "password" not in got["filled"]
+    finally:
+        op.close()
+        c.close()
+
+
+def test_requested_website_limits_an_item_with_multiple_saved_origins(lab):
+    d, c = start(urls=[lab.good + "/login.html", lab.bad + "/login.html"], PASS_CDP_PORT=str(lab.port))
+    op = Operator(d)
+    try:
+        # The other saved origin is open, but must not be chosen as a fallback.
+        assert "no open tab" in error(c, "fill_login", **ITEM, website=lab.good)
+        assert value(lab.phish, "#pw") == "" and op.prompts == []
+        with tab(lab, "/login.html") as page:
+            # Two saved origins are open; pinning selects only the requested one.
+            result = c.call("fill_login", **ITEM, website=lab.good, auto_2fa=False)
+            assert result == {"filled": ["username", "password"], "submitted": False}
+            assert value(page, "#pw") == PASSWORD and value(lab.phish, "#pw") == ""
+            assert op.prompts[-1]["origin"] == lab.good
+            assert "not a saved origin" in error(c, "fill_login", **ITEM, website="https://not-saved.example")
+            assert len(op.prompts) == 1
+    finally:
+        op.close()
+        c.close()
+
+
+def test_otp_website_restriction_cannot_fall_back_to_another_saved_origin(lab):
+    d, c = start(urls=[lab.good, lab.bad], PASS_CDP_PORT=str(lab.port))
+    patch_totp(d)
+    op = Operator(d)
+    try:
+        with tab(lab, "/login.html") as page:
+            page.set_content('<form onsubmit="return false"><input id=otp autocomplete=one-time-code maxlength=6><button>Verify</button></form>')
+            got = c.call("fill_totp", **ITEM, website=lab.good)
+            assert got["totp"] == "filled" and value(page, "#otp") not in json.dumps(got)
+            assert op.prompts[-1]["origin"] == lab.good
+            assert "not a saved origin" in error(c, "fill_totp", **ITEM, website="https://not-saved.example")
+            assert len(op.prompts) == 1
+    finally:
+        op.close()
+        c.close()
 
 if __name__ == "__main__":
     root = tempfile.mkdtemp()

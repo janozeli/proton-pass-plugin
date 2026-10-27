@@ -59,7 +59,7 @@ def test_session_info_commands_use_this_script_and_instructions_have_no_install_
                 "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t"}}})
         text = c.read()["result"]["instructions"]
         assert "~/.cursor/plugins/local" not in text
-        assert "setup_command" in text and "renew_command" in text and "grant_command" in text
+        assert "connect" in text and "renew" in text and "grant" in text
         os.remove(os.path.join(d, "pat"))
         failed = json.loads(error(c, "session_info"))
         assert failed["error"] == "PAT file cannot be read", failed
@@ -81,7 +81,7 @@ def test_session_info_warns_below_14_days_and_hides_a_token_stored_beside_the_me
         blob = json.dumps(info)
         assert "pst_" not in blob and "SHOULD_NOT_LEAK" not in blob, blob
         assert info["name"] == "cursor-agent" and info["days_remaining"] == 10, info
-        assert info["expiration_warning"] is True and "setup --renew" in info["warning"], info
+        assert info["expiration_warning"] is True and "mode=renew" in info["warning"], info
         later = int(time.time()) + 20 * 86400 + 100
         write(d, "pat.meta", {"name": "cursor-agent", "expires_at": later, "vaults": ["V"]})
         os.chmod(os.path.join(d, "pat.meta"), 0o600)
@@ -122,12 +122,12 @@ def test_create_login_waits_for_approval_and_does_not_return_the_password():
         op = Operator(d)
         got = c.call("create_login", vault="V", title="Mail", username="ada", password=PASSWORD,
                      urls=["https://mail.example/login"], reason="save")
-        assert got == {"item_id": "item-new"}, got
+        assert got == {"share_id": "share1", "item_id": "item-new"}, got
         assert PASSWORD not in json.dumps(got) and PASSWORD not in json.dumps(op.prompts)
         assert all(PASSWORD not in json.dumps(call) for call in calls(d))
         body = created(d)
         assert body["password"] == PASSWORD and body["title"] == "Mail" and body["username"] == "ada"
-        assert op.prompts[-1]["action"] == "write" and op.prompts[-1]["change"] == "create login"
+        assert op.prompts[-1]["action"] == "write" and "create login in vault share1" in op.prompts[-1]["change"]
         op.close()
     finally:
         c.close()
@@ -141,7 +141,7 @@ def test_generate_password_is_not_returned_or_passed_on_the_command_line():
         got = c.call("create_login", share_id="share1", title="Mail", generate_password=True, reason="save")
         body = created(d)
         secret = body["password"]
-        assert got == {"item_id": "item-new"} and secret and secret not in json.dumps(got)
+        assert got == {"share_id": "share1", "item_id": "item-new"} and secret and secret not in json.dumps(got)
         assert secret not in json.dumps(op.prompts)
         assert all(secret not in json.dumps(call) for call in calls(d))
         assert error(c, "create_login", share_id="share1", title="Mail", password=PASSWORD,

@@ -2,14 +2,15 @@ import json, os, subprocess, sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 class Client:
-    def __init__(self, env=None, drop=()):
+    def __init__(self, env=None, drop=(), capabilities=None, consent=None):
         merged = dict(os.environ, **(env or {}))
         for key in drop:
             merged.pop(key, None)
         self.p = subprocess.Popen([sys.executable, f"{ROOT}/server/proton_pass_mcp.py"], stdin=subprocess.PIPE,
                                   stdout=subprocess.PIPE, text=True, env=merged)
         self.n = 0
-        self.rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test"}})
+        self.consent = consent
+        self.rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": capabilities or {}, "clientInfo": {"name": "test"}})
         self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
     def send(self, obj):
@@ -30,6 +31,9 @@ class Client:
         self.n += 1
         self.send({"jsonrpc": "2.0", "id": self.n, "method": method, "params": params or {}})
         msg = self.read()
+        while msg.get("method") == "elicitation/create" and self.consent is not None:
+            self.send({"jsonrpc": "2.0", "id": msg["id"], "result": self.consent(msg["params"])})
+            msg = self.read()
         if "error" in msg:
             raise RuntimeError(json.dumps(msg["error"]))
         return msg["result"]
@@ -42,4 +46,6 @@ class Client:
         return json.loads(text)
 
     def close(self):
-        self.p.stdin.close(); self.p.wait()
+        self.p.stdin.close()
+        self.p.wait()
+        self.p.stdout.close()

@@ -27,6 +27,7 @@ jobs:
           python3 -m playwright install --with-deps chromium
       - name: Offline tests
         run: |
+          set -euo pipefail
           for test in tests/test_*.py; do
             python3 "$test"
           done

@@ -1,158 +1,230 @@
-# Proton Pass plugin
+# Proton Pass for Grok Bot
 
-Stdio MCP server. It wraps the official [`pass-cli`](https://protonpass.github.io/pass-cli/). Agent guidance is the `instructions` field of the MCP initialize result, plus each tool's description and argument descriptions. A host that only surfaces MCP tools still gets it. The server uses Python and `idna` (`pip install -r requirements.txt`). `fill_login` also needs Playwright.
+Connect Proton Pass to the Bot's **shared cloud computer**, authenticate in the
+Proton browser flow, and fill saved website logins without copying tokens or
+returning passwords or OTPs to the model. Uses the official
+[Proton Pass CLI](https://protonpass.github.io/pass-cli/) through an MCP stdio server.
 
-The agent can list vaults, search items, and read item metadata. It never receives a password, a note, or a TOTP seed back from a tool. A generated TOTP code is single-use and lasts about 30 seconds, so `get_totp` and `fill_login` may return that code. `fill_login` types a login into a browser tab and can type the current code into a 2FA field. `create_login` stores a login after you approve and returns only the new item id. `save_totp` stores a TOTP the same way. `pass-cli` cannot edit a login TOTP in place, so `save_totp` creates a new item, deletes the old one, and returns both `item_id` and `replaced_item_id`. `run_approved` runs one program with secrets in its environment. Each release waits until you type `approve` in a terminal that the agent cannot write to.
+## Natural Bot workflows
 
-The approval helper and `run_approved` need Linux. The helper checks the caller's uid with `SO_PEERCRED`, and `run_approved` runs the program inside [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`).
+- **“Sign into this website with my work account.”** `find_login` matches the
+  exact saved origin, optionally the exact username/email. It works even when
+  the saved title is unrelated to the website. A unique match returns ready
+  `fill_arguments`; multiple matches return `choose_account`. The Bot asks which
+  account to use rather than choosing the first. `fill_login`/`fill_totp` keep
+  the requested `website` restriction even when that item has other saved sites.
+- **“Save a login for this signup.”** `create_login` generates its password using
+  the official CLI by default. Optional `password_length` (16–128, default 20)
+  and `password_symbols` (default true) adapt to site rules. It returns both
+  IDs needed for filling. Creating an item is not website account registration.
+- **“Use a disposable email for this signup.”** `create_alias` asks for approval
+  and returns the new forwarding address plus item IDs. This needs write access
+  and Proton alias eligibility; it does not read incoming messages.
+- **“Use the API key stored in Proton for this program.”** `search_items` finds
+  the item; `describe_item` returns `pass://` references, including section names
+  for custom fields. The Bot passes references to `run_approved`, without seeing
+  their values. That runner currently returns only an exit code and cannot
+  access workspace files; see the limitations below.
 
-## Install
+`capabilities` describes these workflows and approval support without accessing
+Proton. `session_info` reports `connected`, `disconnected`, `incomplete`, or
+`unavailable` with recovery guidance. Cloud responses guide the Bot to `connect`;
+legacy shell setup commands are returned only in terminal mode.
 
-Install `pass-cli` from the [pass-cli docs](https://protonpass.github.io/pass-cli/). The default path is `~/.local/bin/pass-cli`. For `run_approved`, install bubblewrap and libseccomp (`sudo apt install bubblewrap libseccomp2` on Debian and Ubuntu). On Ubuntu 24.04 and later, `bwrap` also needs unprivileged user namespaces, which AppArmor blocks by default (`kernel.apparmor_restrict_unprivileged_userns`).
+Names are not identifiers: searches use share IDs internally and reject an
+ambiguous vault name. A write can omit its vault only when exactly one vault is
+accessible. `search_items` and `find_login` support `limit` (0–100) and `offset`,
+returning `next_offset`. Website discovery reads each accessible login under the
+supplied audit reason, since CLI list results omit URLs. For large collections,
+scope the search to a vault/share ID. It does not use a cached password index.
 
-`fill_login` needs the Playwright Python package (`pip install playwright`) and a Chrome process started with `--remote-debugging-port`. The port does not have to be 9222.
+References use IDs and exact field names. Case-insensitive duplicate names and
+names outside the runner's reference syntax are reported in
+`unavailable_reference_fields`; the Bot must not guess a replacement. A write
+timeout does not prove that nothing was saved: inspect existing items before
+retrying. See the [CLI capability review](docs/pass-cli-integration.md) for the
+full feature map and remaining integration work.
 
-The host launches `server/proton_pass_mcp.py` over stdio. `.cursor-plugin/plugin.json` points at `mcp.json` for hosts that load this repository as a plugin. That manifest starts the script from the host's plugin root. Do not hardcode an install directory. A host may cache the plugin under a versioned path and surface only the MCP tools. From a checkout, run `python3 server/proton_pass_mcp.py` in the directory that contains `server/`.
+## Connect
 
-### Create the agent token
+1. Install this repository as a Cursor/Grok Bot plugin. Its `mcp.json` launches
+   `server/bootstrap.py` on the computer where the stdio server runs.
+2. Ask the Bot to connect Proton Pass, naming the vaults and access role you want.
+   The `connect` tool asks for human confirmation through MCP elicitation.
+3. Open the **Proton authorization link** presented by the Bot and sign in.
+   Proton's CLI receives the authorization automatically. Do not paste a token,
+   OTP or password into the conversation.
+4. If your account requires an additional **Pass password**, the Bot provides a
+   temporary loopback URL. Take over the **cloud computer's browser** and open it
+   there. Enter the password in that page. Opening this URL on your own computer
+   will not reach the cloud process.
+5. The Bot polls `connection_status` until it reports `connected`. Setup keeps
+   only a scoped agent token and removes both temporary account/verification
+   sessions. All your Bots using this installation share the connection.
 
-Do not paste a token. Setup starts `pass-cli login` in a temporary directory (mode 0700), prints the approval URL, creates a vault-scoped agent token, writes only that token to the PAT file, then logs out and deletes the full-account session. The token value is never printed.
+The extra-password form sends its value directly to the login process's
+non-echoing PTY. It does not send it through MCP, a tool argument, or a chat.
+The form binds only to `127.0.0.1`, uses an unguessable path, refuses foreign
+Host/Origin headers, and has no external assets, request logging, or caching.
+It closes when setup finishes or is cancelled. This is a shared-computer trust
+model: it does **not** isolate credentials or that browser from another program
+running as the same OS user. The Bot must leave the form to the human and must
+not inspect or screenshot it.
 
-Public `pass-cli login` with no flags is web login, from the [login command](https://github.com/protonpass/pass-cli/blob/main/docs/public/docs/commands/login.md): it prints a URL, you approve it in a browser, and the CLI continues. That flow supports SSO, two-factor authentication, and hardware security keys. If the account has a Proton Pass extra password, type it at the prompt on this terminal after the browser step. Setup drops `PROTON_PASS_EXTRA_PASSWORD` and `PROTON_PASS_EXTRA_PASSWORD_FILE` from the login environment so a leftover value is not used. The public `login` command has no `--interactive` flag. That flag is compiled only into internal builds (`#[cfg(feature = "internal")]`), and this setup does not pass it. `login --pat` (alias `--personal-access-token`) accepts `pst_<token>::<key>` and is how the server later logs in with the agent token. Setup does not use it for the account login.
+### Permissions and recovery
 
-`pass-cli agent create <name> --expiration <1h|1d|1w|1m|3m|6m|1y>` prints JSON whose `token` field is `PROTON_PASS_PERSONAL_ACCESS_TOKEN=pst_...::key`. That is the only time pass-cli shows the value. `agent create --vault` grants the Viewer role only, so setup creates the agent with no `--vault` and then runs `agent access grant <name> --vault-name <name> --role <role>`. The default role is `editor`, which `create_login` and `save_totp` need. `--role viewer` keeps the token read-only. `--role manager` is the other grant the CLI accepts. Manager can also manage who has access to the vault.
+- `viewer`: read and fill existing logins.
+- `editor` (default): also create/edit items. Use a dedicated vault such as `Bots`.
+- `manager`: also manage vault access. Proton's owner's primary `Personal` vault
+  rejects `editor`; explicitly choose `viewer` or `manager` there.
 
-After those grants, setup logs in with the new agent token in a second temporary directory (mode 0700), runs `share list --only-vaults=true --output json`, and checks that each vault's `share_role` matches the requested role, ignoring case. The same check runs for `setup --grant`. If a role does not match, setup exits with an error and does not update `pat.meta`. The token from `agent create` is still saved, because pass-cli shows it only once. Both the full-account directory and the verification directory are logged out with `--force` and deleted, including when setup fails.
+The confirmation displays the requested vaults, role and lifetime before login.
+`connect` mode `renew` renews the existing token; `grant` changes one vault's
+access; `resume` completes saved pending grants after partial failure. Each uses
+browser authorization and human confirmation. There is no automatic privilege
+escalation. A newly issued token is persisted **before** grants, listing or role
+verification can fail. Pending setup blocks ordinary tools until recovery.
 
-From the plugin directory (the directory that contains `server/`), the first setup looks like this:
+Agent sessions last two hours; the plugin automatically logs in again using the
+saved token on an expired-session response. The token's lifetime is separate
+(default one year). `session_info` reports its expiry and warns within 14 days;
+renewal requires browser authorization. Missing/revoked tokens are not recovered
+by asking for their value in chat.
 
-```bash
-python3 server/proton_pass_mcp.py setup --vault "Bots" --name cursor-agent
-```
+`cancel_connection` stops a pending login and removes its temporary sessions.
+Once token/grant changes are being committed, cancellation is refused until the
+transaction finishes, so a remote change is not silently abandoned.
+`disconnect` asks for confirmation and removes the shared local token and login.
+It does **not** revoke the remote Proton token: revoke that in Proton Pass if
+needed. Disconnecting affects all Bots sharing the installation.
 
-Once the server is running, call `session_info` and use the `setup_command`, `renew_command`, and `grant_command` it returns. Each one is `python3` plus the absolute path of the running `proton_pass_mcp.py`. Copy that path. Do not guess where the host installed the plugin. If `session_info` fails because no token exists yet, the error text is JSON and still includes `setup_command`.
+## Approvals and host requirements
 
-Repeat `--vault` for more than one vault. `--expiration` defaults to `1y`. The PAT file is `~/.config/pass-agent/pat` (mode 0600). A sidecar `pat.meta` (mode 0600) stores the agent name, vaults, per-vault `roles`, and expiration timestamp. It does not store the token. `role` is also set when every vault has the same role. The server refuses a token file that the group or other users can access, a symlink, or a file another user owns. Metadata with any of those problems is ignored, so `session_info` reports no expiration.
+The default approval mechanism is the host's **MCP form elicitation** support.
+The server checks the capability advertised by the client at initialization.
+Every release binds the confirmation to the operation, item, exact origin or
+command, and reason. Decline, timeout, malformed replies or disconnect deny it.
+Forms never ask for passwords, OTPs, seeds or tokens. Network access for a
+sandboxed command requires a separate affirmative checkbox.
 
-The temporary directory is deleted after `pass-cli logout` and `logout --force`. The plugin's own `PROTON_PASS_SESSION_DIR` is a different directory and holds only the agent login.
+**A host that does not advertise elicitation cannot approve releases or start
+connection setup.** The plugin fails closed and reports this requirement. It
+never silently trusts an assistant's `approved=true` argument or launches a
+terminal approval helper. The native 1Password cards are a product integration;
+this plugin does not claim to provide those private interfaces.
 
-When fewer than 14 days remain, `session_info` warns and includes `renew_command`. Renewing repeats the browser approval. `agent renew` replaces the token immediately and keeps the existing grants. From the plugin directory, or by running the exact `renew_command` from `session_info`:
+Grok Bot's actual elicitation UI, human takeover, persistent disk and browser
+CDP accessibility must be checked in the deployed host. A green local test is
+not evidence of those host capabilities or a successful real Proton login.
 
-```bash
-python3 server/proton_pass_mcp.py setup --renew
-```
+## Cloud runtime
 
-`--renew` reads the agent name from `pat.meta` and cannot be combined with `--vault`. Pass `--expiration` to choose a new lifetime. The default is again `1y`.
+The launcher provisions a private Python environment with pinned `idna` and
+Playwright dependencies and downloads Proton CLI **2.5.1** from Proton, checking
+its pinned SHA-256. It does not install a separate browser: it attaches to the
+Bot's existing Chromium browser over loopback CDP. Python 3 with `venv` support,
+Linux x86_64/aarch64 and outbound access to Proton/PyPI are required.
 
-Changing a vault role repeats the browser approval and runs `agent access grant` for the agent name stored in `pat.meta`. It does not create a token. A second grant on a vault that already has access changes the role in place (`viewer` to `manager` and back). `agent access revoke --share-id` returned `NotExists` for both the owner share id and the agent share id, so setup does not revoke.
+Runtime data defaults to `/workspace/.proton-pass` when `/workspace` is writable,
+otherwise `~/.local/share/proton-pass-plugin`. It is outside the versioned plugin
+cache. Bootstrap is locked across processes, repeatable, and reconstructs a
+missing Python environment without replacing the token. A changed Python version
+or dependency lock creates a new environment. Bootstrap output goes to stderr;
+stdout is reserved for MCP JSON-RPC.
 
-From the plugin directory, or by running the exact `grant_command` from `session_info` (replace `VAULT` and `ROLE` only):
+The launcher defaults to Proton's `fs` key provider for persistence across
+process/VM restarts: its key is stored alongside the encrypted session, protected
+by filesystem permissions. This intentionally follows the user's shared cloud
+computer model. An explicit key provider configuration takes precedence.
 
-```bash
-python3 server/proton_pass_mcp.py setup --grant --vault "Bots" --role editor
-```
+| Variable | Purpose |
+| --- | --- |
+| `PASS_STATE_DIR` | Persistent runtime/credential root for the launcher |
+| `PASS_CLI` | Explicit installed CLI executable; skips the bundled CLI download |
+| `PASS_PAT_FILE` | Override token path; defaults to `PASS_STATE_DIR/pat` in the launcher |
+| `PROTON_PASS_SESSION_DIR` | Shared scoped CLI session directory; defaults to `PASS_STATE_DIR/session` |
+| `PROTON_PASS_KEY_PROVIDER` | `fs` by default in the launcher; explicit `env`/`keyring` supported |
+| `PROTON_PASS_ENCRYPTION_KEY` | Key for an explicitly selected `env` provider; never a tool argument |
+| `PROTON_PASS_LINUX_KEYRING` | Optional `dbus`; corresponding D-Bus environment is forwarded only then |
+| `PASS_CDP_PORT` | Optional loopback CDP port, overridden by a tool's `cdp_port` |
+| `PASS_APPROVAL_MODE` | `mcp` default; `terminal` is explicit legacy compatibility |
 
-`--grant` needs exactly one `--vault` and `--role viewer`, `editor`, or `manager`. It cannot be combined with `--name`, `--expiration`, or `--renew`. On success, `pat.meta` records that vault's new role.
-
-The owner's primary vault named `Personal` rejects `--role editor` with `NotAllowed`. `viewer` and `manager` succeed there. The error says to grant `editor` on a dedicated vault, or to grant `manager`. Manager can also manage who has access to the vault.
-
-A running server keeps the previous `share_role` in its session until it logs in again. `session_info` and the write check do that login themselves. A restart is not required. The server still never runs `pass-cli info`.
-
-A token file you created by hand still logs in. `session_info` then leaves `expires_at` null and does not warn, because no expiration was recorded. Use `setup` so the warning and `renew_command` exist. The same report includes `setup_command` and `grant_command`.
-
-## Start the approval helper
-
-Run the helper in a terminal that you keep open, from the plugin directory:
-
-```bash
-python3 server/proton_pass_mcp.py approve
-```
-
-The helper listens on `approve.sock` in the session directory. It reads your answer from its own terminal (`/dev/tty`), not from a pipe. For each request it prints the item title, the exact origin, the write change, or the exact argv, and the agent's reason. A write request shows `create login` or `attach TOTP by replacing the login`. It does not show the password or the TOTP seed.
-
-```text
-proton-pass release request
-  action:  run
-  argv:    '/usr/bin/psql'
-           '--host=127.0.0.1'
-           '--command=select 1'
-  env:     'PGPASSWORD' = 'pass://SHARE_ID/ITEM_ID/password' (field 'password' of 'Dev database')
-  network: off (type approve-net to allow it)
-  reason:  'check the dev database is up'
-Type approve to release. Anything else denies.
-```
-
-Every string on the prompt, including item titles from your vault, is printed with Python `repr`, so an escape sequence shows up as text and cannot redraw your terminal. Type `approve` to release the request. For a `run_approved` request, type `approve-net` to release it with network access. Any other line denies it. A request that gets no answer within 180 seconds is denied. The helper monitors both the terminal and the client connection, discards disconnected requests, and proceeds to the next request even if no complete answer was typed.
-
-If the helper is not running, `fill_login`, `get_totp`, `create_login`, `save_totp`, and `run_approved` fail with `approval unavailable`. `list_vaults`, `search_items`, `describe_item`, and `session_info` keep working.
-
-## Configure
-
-`mcp.json` leaves configuration to the process environment. The server and the helper read these variables and expand `~`:
-
-| Variable | Default | Role |
-| --- | --- | --- |
-| `PASS_CLI` | `~/.local/bin/pass-cli` | `pass-cli` binary |
-| `PASS_PAT_FILE` | `~/.config/pass-agent/pat` | Personal access token file (mode 0600 or 0400) |
-| `PROTON_PASS_SESSION_DIR` | `~/.local/share/pass-agent` | Session directory for this agent, separate from a normal `pass-cli` login. It also holds `approve.sock` |
-| `PASS_CDP_PORT` | unset | Optional Chrome remote-debugging port on `127.0.0.1`. A `fill_login` `cdp_port` argument wins over this. When both are unset, `fill_login` discovers a loopback Chrome |
-
-Set a variable in `mcp.json` under `mcpServers.proton-pass.env` when a default is wrong. Give the helper the same `PROTON_PASS_SESSION_DIR`, or the server will not find it. Do not put the token itself in `mcp.json` or in the repository.
+All Bot processes using the same PAT file serialize credential operations and
+session refreshes with an OS lock. A separate setup lock prevents simultaneous
+browser setups. Connection status belongs to the MCP process that started it;
+if that process restarts, use `session_info` to inspect the saved shared state.
 
 ## Tools
 
-The initialize result's `instructions` field is the usage guide: when to call this server, which tool to pick, read-only vaults, approval, and what to do with each error. Per-tool rules live on that tool's description and on its arguments. Tool results stay the values below. They do not repeat the guide.
+| Tool | Result visible to the model |
+| --- | --- |
+| `capabilities` | Supported workflows, limitations and host approval support; no login |
+| `connect` | Connection ID and state; sometimes the Proton authorization URL |
+| `connection_status` | State, authorization link or temporary cloud form link; no credentials |
+| `cancel_connection` | Cancellation status |
+| `disconnect` | Local disconnect result and explicit remote-revocation status |
+| `session_info` | Vault roles, token expiry, approval capability and recovery guidance |
+| `list_vaults`, `search_items`, `describe_item` | Vault/item metadata; no secret values |
+| `find_login` | Exact-origin candidates, account choice or fill arguments; no filling |
+| `fill_login` | Fields filled, submission/detection status; no password or OTP |
+| `fill_totp` | Fills a later OTP screen; result contains status only |
+| `create_login` | Generated password stored in a vault; returns share and item IDs |
+| `create_alias` | New forwarding email address and share/item IDs |
+| `run_approved` | Exit code of a sandboxed command; no output |
 
-| Tool | Needs approval | What the model receives |
-| --- | --- | --- |
-| `list_vaults` | No | Vault names and ids |
-| `search_items` | No | Title, type, vault, `share_id`, `item_id`. Trashed items are omitted |
-| `describe_item` | No | Origins (scheme, host, and port), username, email, and booleans for password, TOTP, and note. No path, query, or fragment |
-| `session_info` | No | Agent-token identity, name, each vault's role and `read` or `write` access, `expires_at`, `days_remaining`, and a warning when fewer than 14 days remain. Includes `setup_command`, `renew_command`, and `grant_command`, each `python3` plus this server's absolute path. If login fails, the error text is JSON and still includes those commands. Logs out and back in before reading roles. Does not call `pass-cli info` |
-| `get_totp` | Yes | `{"code": "123456"}`. The code is not a secret. The seed is not returned |
-| `fill_login` | Yes | `{"filled": ["username", "password"], "submitted": false}`. When a 2FA field was filled, `filled` also contains `"totp"`, plus `"totp"` (the code) and `"totp_submitted"`. If 2FA field detection fails, `"totp"` is `"detect_failed"` and the password fill is still returned. No URL, password, or seed |
-| `create_login` | Yes | `{"item_id": "..."}`. The password and any seed are stored and not returned |
-| `save_totp` | Yes | `{"item_id": "...", "replaced_item_id": "..."}`. The item id changes. A delete failure is an error whose text is JSON and still includes `replaced_item_id`. The seed and password are not returned |
-| `run_approved` | Yes | `{"exit_code": 0}`. No output |
+There is **no `get_totp` tool**. `fill_login` and `fill_totp` report `totp: filled`
+or `totp: detect_failed`, never digits. The cloud tool schema accepts no raw
+password or TOTP seed. Import an existing secret through Proton itself.
 
-Pass a short `reason`. The helper shows at most 300 characters of it, and at most 1024 characters of each argv element. Proton stores the reason in the audit log. A reason that still contains `pass://` after Unicode normalization is rejected.
+Browser filling requires exactly one main-frame tab matching a saved website's
+origin (scheme, host and port). Subdomains are not implicit matches. Port
+discovery probes loopback Chrome CDP endpoints and refuses ambiguity. Filling
+runs in an isolated world, rechecks the origin after approval, and refuses
+hidden/disabled/inert/unfocusable password inputs. A password form is never
+automatically submitted. An OTP form separate from a password form may be
+submitted; a code in the password form is filled but left unsubmitted.
 
-## Security model
+`run_approved` additionally requires Linux bubblewrap, libseccomp and a supported
+core-dump policy. It deliberately refuses systems using an external core-dump
+collector. The sandbox has a private process namespace, no workspace/home access,
+no output, and no network unless separately approved. These optional system
+requirements are not installed or modified by bootstrap.
 
-The model is not a trusted caller. It may name an item and give a reason. It may not choose where a secret goes, and it may not read one back. The tool schema is where that rule lives. No tool takes a command string, a URL to match, a CSS selector, or a working directory. `fill_login` accepts an optional `cdp_port` integer. It is only a port: the server still connects to `127.0.0.1` and rejects a websocket whose host is anything else. At startup the server checks every tool and parameter name against a forbidden set (`get_secret`, `run_with_secrets`, `command`, `url_match`, `url`, `username_selector`, `password_selector`, `cwd`, `value`, `totp_uri`) and exits if one appears. `create_login` is the one tool with a `password` argument, so a password the caller already has can be stored. The result is only `item_id`. TOTP input is named `otpauth_uri` or `seed`, never `totp_uri`, and neither value is returned.
+## Legacy terminal operation
 
-`fill_login` takes its targets only from the websites saved on the item. An origin uses the browser's spelling of scheme, host, and port. The host is lowercase punycode using non-transitional UTS #46 processing. Unsupported or ambiguous URLs (including backslashes, controls, invalid IDNA and legacy IPv4 spellings) are rejected. IPv6 is in brackets. The port is omitted when it is 443 for `https` or 80 for `http`. A saved URL without a scheme counts as `https`. `http` matches only a saved `http` URL. Matching is equality, so `login.bank.com` does not match a saved `bank.com`. An optional `cdp_port` argument is validated with `parse_port` and is the only port that is probed. It wins over `PASS_CDP_PORT` and over auto-discovery. When `cdp_port` is omitted, `PASS_CDP_PORT` is that port. When both are unset, the server looks for Chrome, Chromium, Edge, or Brave on `127.0.0.1`: process command lines that contain `--remote-debugging-port`, and `DevToolsActivePort` files under the usual Chrome, Chromium, Edge, and Brave config directories plus `/tmp` and `/dev/shm`. A candidate is used only after `http://127.0.0.1:<port>/json/version` returns a browser websocket whose host is `127.0.0.1`. One verified browser is used. When several are listening, the one with a page whose origin matches the item is used. If none or more than one still matches, nothing is typed, and the error lists the candidate ports. It never guesses and never includes tab URLs. A websocket whose host is not `127.0.0.1` is rejected. Exactly one tab's main frame must match. If none or several match, nothing is typed. The server asks you, then types from an isolated world the page cannot hook. That world checks `location.origin` again before it writes the password, so a tab that navigated while you read the prompt receives nothing. The password goes only into the first visible `input[type=password]` in the main frame, never into a hidden field, an iframe, or a text box. Eligible inputs must have positive width and height, must not be effectively disabled (including by a fieldset), and must accept browser focus. Immediately before each credential write, the isolated world calls `focus({preventScroll: true})` and requires the deep active element to be that input, walking open and CDP-accessible closed shadow roots. The focus verdict and write run synchronously in the same browser task; modal order and inert ancestors are not modeled separately. Inputs in those shadow roots are supported; if a root is unavailable, its inputs are skipped. After username events, the server selects and validates the password field again. After all synchronous input, change, and focus handlers, it reports a successful password fill only if the field remains connected, eligible, in the same form, and contains the requested value. It reports the username only if that field also remains connected, eligible, of a supported username type, in the password field's form, and contains the requested value. Automatic submission (`submit: true`) is refused before approval or filling. A form's action does not determine its final destination: submit buttons can override it and page event handlers can change it or issue requests during filling. Omit `submit` or set it to `false`, then inspect and submit the password form manually. `"submitted": false` means the server did not submit the password form. `auto_2fa` defaults to true. After the username and password are in place, if the page shows a one-time-code field and the item has a TOTP URI, the server generates the current code and types it. If fewer than 3 seconds remain in the step, it waits for the next code. A code field in its own form may be submitted (`totp_submitted` is true). A code field in the password form is filled and left unsubmitted, because submitting that form would send the password. Set `auto_2fa` to false to skip this. Detection walks open shadow roots only, so a one-time-code field inside a closed shadow root is skipped; use `get_totp` for that page. The returned code is not a secret. The seed never appears in the result or in an error. If detection of the 2FA field fails, the password fill is still returned and `totp` is `detect_failed`. A page with no 2FA field omits `totp`. Errors report the number of open tabs, never their URLs.
+Direct `python3 server/proton_pass_mcp.py` execution uses the current interpreter
+and needs `pip install -r requirements.txt`. `PASS_CLI` defaults to the executable
+on PATH, then `~/.local/bin/pass-cli`. Direct execution retains the former token
+and session paths (`~/.config/pass-agent/pat`, `~/.local/share/pass-agent`).
 
-`run_approved` runs the argv you approved and nothing else. Every argument is limited to 1,024 characters and displayed in full; longer arguments are rejected before approval or secret access. `argv[0]` must be an absolute path, and the server never adds `bash` or `-c`. A reference is exactly `pass://SHARE_ID/ITEM_ID/FIELD`. The server rejects `?`, `#`, `%`, an extra slash, and a leading `-`. `pass-cli` treats `?totp=uri` as a request for the TOTP seed and percent-decodes each segment, so those spellings never reach it. A `reason` that contains `pass://` after Unicode normalization is rejected. `pass-cli run` resolves a `pass://` value in any environment variable, including the audit reason. A reply from the helper can only allow or deny. It cannot change the argv. `pass-cli run` starts with stdin, stdout, and stderr on `/dev/null`. Its environment is an allowlist: `PATH`, `PROTON_PASS_SESSION_DIR`, a fixed `PROTON_PASS_AGENT_REASON`, and the bindings under names `PP0`, `PP1`, and so on. The names you approved are not in that environment, so a linker variable such as `LD_AUDIT` cannot run code before `bwrap` starts. Inside the sandbox a trusted Python trampoline first installs a libseccomp filter that denies `add_key`, `request_key`, and `keyctl` with `EPERM`, including with `approve-net`. The filter rejects non-native syscall ABIs and remains active across exec and child processes. If the library is unavailable or filter setup fails, the approved program is never executed. The trampoline then renames `PP0` to the approved name and drops every other variable. The command is `pass-cli run -- bwrap --unshare-user --unshare-pid --unshare-ipc --unshare-net --die-with-parent --unsetenv ... -- <argv>`. `bwrap` removes the session directory, the reason, the token, `PASS_PAT_FILE`, `PASS_CLI`, and `HOME` from the environment, and sets `HOME=/tmp` and `PATH=/usr/bin:/bin`. The program sees `/usr`, `/bin`, `/lib`, and `/lib64` read-only, plus `/etc/resolv.conf`, `/etc/hosts`, `/etc/nsswitch.conf`, and `/etc/ssl`. It also sees a private `/proc`, a fresh `/dev`, and an empty `/tmp` as its working directory. Host processes are not in that `/proc`. System V IPC objects live in a private IPC namespace, including with `approve-net`. It cannot see your home directory, the session directory, or the token file. Without `approve-net` it has its own network namespace and cannot reach the host's ports. `approve-net` drops only `--unshare-net`. If `bwrap` is missing, the server refuses the request before asking you. If `bwrap` fails to start the program, the exit code is nonzero and nothing runs outside the sandbox. Output is discarded. Since no output comes back, a short secret or an encoded secret has no path to the model, and the server keeps no redaction list.
+Explicit `PASS_APPROVAL_MODE=terminal` retains the `approve` helper for local
+operators and exposes legacy secret-import tools (`save_totp` and raw-secret
+arguments to `create_login`). It does not restore a tool that returns OTPs. This
+mode is not the Grok Bot workflow. Legacy setup remains available:
 
-`run_approved` requires a file-based kernel core-dump policy. It refuses external collectors (`core_pattern` beginning with `|` or `@`), including systemd-coredump: the kernel can bypass `RLIMIT_CORE` for a collector, and discarding the dump does not guarantee that sensitive process metadata stays out of logs. The server checks the policy before accessing the item and again immediately before starting `pass-cli run`. That child receives soft and hard `RLIMIT_CORE` limits of zero, inherited by the sandbox and its descendants. An unreadable policy or failure to apply the limits refuses execution. The host administrator must keep this policy in place while programs run; the plugin never changes host sysctls.
-
-With `approve-net`, name lookup uses those `/etc` files and TLS uses `/etc/ssl`. The rest of `/etc` is not mounted. Without `approve-net` the network namespace is empty, so name lookup fails.
-
-The session directory must be a real directory that you own. The server creates it mode 0700. A directory this user owns with a looser mode is changed to 0700. The server refuses to start if the directory is owned by someone else, or if the directory or its `.session` file is a symlink. Give each bot its own `PROTON_PASS_SESSION_DIR`. `pass-cli` itself refuses a `.session` file that the group can read and does not change that mode. `share_id`, `item_id`, and vault names that start with `-` or contain a newline never reach `pass-cli`. Errors are fixed strings such as `pass-cli item failed`. They never include `pass-cli` stderr, a password, or a TOTP seed. The server never runs `pass-cli info`. A logged-out response from that command can delete the agent session. `session_info` uses `vault list` and `share list --only-vaults=true`, plus the local `pat.meta` expiration. Before reading vault roles, `session_info` and the write check log out and back in with the agent token. `pass-cli` keeps `share_role` in the session, and a grant does not update that cache; only a new login sees the new role. Logout removes `PROTON_PASS_SESSION_DIR/.session` and leaves `approve.sock` in place. The server also logs in again when `pass-cli` reports an unauthenticated client, an unauthorized token, or an expired session. An agent login lasts about two hours. The `1h`..`1y` value is the token lifetime, which is what `session_info` reports.
-
-`create_login` and `save_totp` check the vault role before approval. Viewer, an unknown role, and a custom role are read-only. The error says reading and filling still work and that creating or editing needs Editor, Manager, or Owner. `pass-cli item update` cannot change a login's `totp_uri` (it creates a custom field and leaves the login TOTP unchanged, and editing an existing TOTP field is unsupported). `save_totp` therefore creates a new login from the title, username, email, password, and URLs, then deletes the old item. The approval prompt states that the item id will change and names the item that will be deleted. Success returns `item_id` and `replaced_item_id`. If deleting the old item fails, the new item is deleted so the vault does not keep both. That error is JSON and includes `replaced_item_id` and `removed_item_id`. If the new item cannot be removed either, the error names both surviving ids so the duplicate is not silent. It refuses when the item has a note, extra fields, or passkeys, so those are not dropped. Passkeys are not copied: `LoginItem.passkeys` exists, but `item create login` stores an empty list, and pass-cli has no register command. A passkey is created by the site and the Proton Pass browser authenticator. A Chrome virtual authenticator would keep the credential in the browser, so this plugin does not create one.
-
-## What this does not stop
-
-- Another process running as your user can bind the approval socket before the helper does, and it can read the token file from outside the sandbox. Such a process does not need this server to reach your vault.
-- Agent cancellation over MCP is not implemented; closing the approval connection or reaching its deadline cancels the terminal request.
-- The exit code is one byte that the model sees.
-- With `approve-net`, an approved program can send its secrets to any network it can reach.
-- `fill_login` without `submit` leaves the password in the page, where anything that can read the page can read it.
-
-## Tests
-
-Offline tests use a fake `pass-cli` that resolves `pass://` values and execs the `run` argv, and they speak MCP over stdio. The run tests need `bwrap`, `libseccomp.so.2`, `/usr/bin/python3`, and kernel keyring support, plus a file-based `core_pattern`. Run them in a disposable VM or CI runner configured with `kernel.core_pattern=core`; do not change a shared host's dump policy for tests. `test_core.py` also tests refusal on hosts with external collectors, and performs synthetic crash checks only under a file-based policy. `test_fill.py` drives a headless Chromium from Playwright (`python3 -m playwright install chromium`). CI runs every `tests/test_*.py`:
-
-```bash
-for test in tests/test_*.py; do python3 "$test"; done
+```sh
+python3 server/proton_pass_mcp.py setup --vault Bots --role editor
+python3 server/proton_pass_mcp.py setup --renew
+python3 server/proton_pass_mcp.py setup --grant --vault Bots --role viewer
 ```
 
-`test_offline.py` checks that initialize returns instructions naming `pass-cli info`, `session_info`, and `fill_login`, and that every tool has a non-trivial description and described arguments. `test_totp.py` checks RFC 6238 vectors, including the wait when fewer than 3 seconds remain. `test_discover.py` checks command-line and `DevToolsActivePort` parsing, an explicit `PASS_CDP_PORT`, a `cdp_port` argument that wins over both, origin matching, and rejection of a websocket host other than `127.0.0.1`. `test_setup.py` uses a fake `pass-cli`: the approval URL is printed, a parent `PROTON_PASS_PERSONAL_ACCESS_TOKEN` is not forwarded, the PAT file receives only the agent token (mode 0600), `agent create` is not given `--vault`, the grant uses the requested role, create and `setup --grant` check `share_role` with a fresh agent login (a capitalized role still matches), a mismatched role fails without updating `pat.meta`, `NotAllowed` for `editor` names the Personal-vault limit, renew replaces the token, no token value is printed, `pass-cli info` is not called, and both session directories are removed on success and on failure. `test_write.py` checks that a stale cached `share_role` is refreshed by logout and login before `session_info` or a write, without calling `pass-cli info` and without deleting the session directory. `test_write.py` checks that `session_info` warns below 14 days, ignores metadata that is not private, still works after the report (the fake `info` command would have logged the session out), returns `setup_command`, `renew_command`, and `grant_command` with the running script's absolute path (including when the token file is missing), that initialize instructions name those commands and contain no install path, refuses a Viewer token before any write, waits for approval before `create_login` or `save_totp`, and that a failed delete either removes the new item or returns both ids. `test_fill.py` includes a headless Chrome on a port other than 9222 with `PASS_CDP_PORT` unset, a `cdp_port` argument that wins over `PASS_CDP_PORT`, a separate 2FA form that is submitted, a 2FA field inside the password form that is filled and not submitted, and a 2FA detection failure reported as `totp: detect_failed`.
+## Validation and sources
 
-These tests do not talk to Proton. A real account is still required to confirm that the printed web-login URL completes, that the extra-password prompt accepts the Proton Pass extra password when the account has one, that `agent create`, `agent access grant`, `agent renew`, and `agent list` succeed against the vault, that the written token logs in, and that `fill_login` types into a real item. `tests/e2e_real.py` covers a logged-in vault for `list_vaults`, `search_items`, `describe_item`, `run_approved`, and `get_totp`. It answers approvals itself and prints no secret values. It needs the token file, `pass-cli`, and `bwrap`. It does not run the browser login or `fill_login`. CI runs the offline tests only.
+The test suite uses fake Proton subprocesses plus real PTYs, stdio MCP, OS locks,
+loopback HTTP and Chromium CDP. It checks browser login completion, cancellation,
+extra-password delivery, host consent, partial setup recovery, OTP non-disclosure
+and hostile page/origin cases. It does not consume real vault data.
 
-## License
+Run `python3 tests/test_cloud.py`, `python3 tests/test_setup.py` and the other
+`tests/test_*.py` entry points. Browser suites need
+`python3 -m playwright install chromium`. Full sandbox tests run on the disposable
+Ubuntu CI runner configured in `.github/workflows/test.yml`; do not weaken a
+workstation's core-dump or namespace policy to run them.
 
-MIT
+- [Proton web login and extra password](https://protonpass.github.io/pass-cli/commands/login/)
+- [Proton agent credentials](https://protonpass.github.io/pass-cli/commands/agent/)
+- [Proton session key providers](https://protonpass.github.io/pass-cli/get-started/configuration/)
+- [Proton CLI downloads and verification](https://protonpass.github.io/pass-cli/get-started/installation/)
+- [Grok Bot computer and apps](https://docs.x.ai/grok-bot/computer-and-apps)
+- [Cursor: connecting 1Password](https://cursor.com/help/grok-bot/connect-apps)
+- [MCP elicitation](https://modelcontextprotocol.io/specification/2025-06-18/client/elicitation)

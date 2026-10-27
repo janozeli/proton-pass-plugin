@@ -45,8 +45,8 @@ def test_get_secret_and_run_with_secrets_are_unknown_tools():
         assert (got := error(c, "get_secret", share_id="share1", item_id="item1")) == "unknown tool get_secret", got
         assert (got := error(c, "run_with_secrets", command="env", env={"PW": REF})) == "unknown tool run_with_secrets", got
         names = [t["name"] for t in c.rpc("tools/list")["tools"]]
-        assert names == ["list_vaults", "search_items", "describe_item", "session_info", "get_totp",
-                         "fill_login", "create_login", "save_totp", "run_approved"], names
+        assert names == ["list_vaults", "search_items", "describe_item", "session_info", "fill_totp",
+                         "fill_login", "create_login", "save_totp", "run_approved", "capabilities", "find_login", "create_alias", "connect", "connection_status", "cancel_connection", "disconnect"], names
         assert calls(d) == [], calls(d)
     finally:
         c.close()
@@ -58,20 +58,25 @@ def test_no_tool_takes_a_forbidden_parameter():
         tools = c.rpc("tools/list")["tools"]
         props = {t["name"]: sorted(t["inputSchema"]["properties"]) for t in tools}
         assert props == {
-            "list_vaults": [], "search_items": ["limit", "query", "type", "vault"],
+            "list_vaults": [], "search_items": ["limit", "offset", "query", "share_id", "type", "vault"],
             "describe_item": ["item_id", "reason", "share_id"], "session_info": [],
-            "get_totp": ["item_id", "reason", "share_id"],
-            "fill_login": ["auto_2fa", "cdp_port", "item_id", "reason", "share_id", "submit"],
-            "create_login": ["email", "generate_password", "otpauth_uri", "password", "reason", "seed",
+            "capabilities": [],
+            "find_login": ["account", "limit", "offset", "reason", "share_id", "vault", "website"],
+            "create_alias": ["prefix", "reason", "share_id", "vault"],
+            "fill_totp": ["cdp_port", "item_id", "reason", "share_id", "website"],
+            "connect": ["expiration", "mode", "role", "vaults"],
+            "connection_status": ["connection_id"], "cancel_connection": ["connection_id"], "disconnect": [],
+            "fill_login": ["auto_2fa", "cdp_port", "item_id", "reason", "share_id", "submit", "website"],
+            "create_login": ["email", "generate_password", "otpauth_uri", "password", "password_length", "password_symbols", "reason", "seed",
                              "share_id", "title", "urls", "username", "vault"],
             "save_totp": ["item_id", "otpauth_uri", "reason", "seed", "share_id"],
             "run_approved": ["argv", "env", "reason"],
         }, props
         assert [t["name"] for t in tools if "password" in t["inputSchema"]["properties"]] == ["create_login"]
         prefer = "Use this MCP server instead of running pass-cli yourself."
-        assert all(prefer in t["description"] and "Never run pass-cli info" in t["description"] for t in tools)
-        totp = next(t for t in tools if t["name"] == "get_totp")
-        assert "not a secret" in totp["description"]
+        totp = next(t for t in tools if t["name"] == "fill_totp")
+        assert "never the code" in totp["description"]
+        assert all("not a secret" not in t["description"] for t in tools)
         fill = next(t for t in tools if t["name"] == "fill_login")
         assert "cdp_port" in fill["description"] and "detect_failed" in fill["description"]
         save = next(t for t in tools if t["name"] == "save_totp")
@@ -89,10 +94,8 @@ def test_initialize_returns_usage_instructions():
                 "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t"}}})
         text = c.read()["result"]["instructions"]
         assert isinstance(text, str) and len(text.strip()) > 200, text
-        for needle in ("pass-cli info", "session_info", "fill_login", "setup_command", "renew_command",
-                       "grant_command", "not a secret", "reading and filling", "approval unavailable",
-                       "release denied", "detect_failed", "bwrap is not installed",
-                       "automatic submission is unavailable", "approve-net", "FIRST"):
+        for needle in ("session_info", "connect", "connection_status", "fill_login", "fill_totp",
+                       "extra_password", "shared", "detect_failed", "elicitation", "Never ask for a token"):
             assert needle in text, needle
         assert "~/.cursor" not in text and "skills/" not in text
         assert c.call("list_vaults")[0]["name"] == "V"
@@ -118,7 +121,7 @@ def test_every_tool_has_a_nontrivial_description():
         assert "submit" in fill["description"] and "auto_2fa" in fill["description"]
         assert "one open" in fill["description"]
         run = next(t for t in tools if t["name"] == "run_approved")
-        assert "sandbox" in run["description"] and "approve-net" in run["description"]
+        assert "sandbox" in run["description"] and "network access" in run["description"]
     finally:
         c.close()
 
@@ -174,7 +177,7 @@ def test_run_child_has_no_network_and_no_host_secrets_under_approve():
         assert runs(d) == [["run", "--", BWRAP, *SANDBOX, *launch(argv, ["PW"])]], runs(d)
         cli_env = json.load(open(os.path.join(d, "run-env.json")))
         assert cli_env == {"PATH": os.environ["PATH"], "PROTON_PASS_SESSION_DIR": session(d),
-                           "PROTON_PASS_AGENT_REASON": "proton-pass plugin", "PP0": REF}, cli_env
+                           "PROTON_PASS_AGENT_REASON": "deploy", "PP0": REF}, cli_env
         assert (fds := json.load(open(os.path.join(d, "run-fds.json")))) == ["/dev/null"] * 3, fds
         try:
             listener.accept()
@@ -470,6 +473,10 @@ def test_describe_item_returns_no_note_card_number_or_private_key():
                 "title": "Bank", "note": note, "content": {kind: content},
                 "extra_fields": [{"name": "backup", "content": {"Hidden": key}}]}}})
             got = c.call("describe_item", share_id="share1", item_id="item1", reason="r")
+            assert not any(secret in json.dumps(got) for secret in (note, card, key)), got
+            refs = got.pop("references")
+            assert refs["number" if kind == "CreditCard" else "private_key"].startswith("pass://share1/item1/")
+            assert got.pop("unavailable_reference_fields") == []
             assert got == {"title": "Bank", "share_id": "share1", "item_id": "item1", "type": kind, "urls": [],
                            "username": "", "email": "", "has_password": False, "has_totp": False,
                            "extra_field_names": ["backup"], "has_note": True}, got
@@ -490,15 +497,12 @@ def test_pass_cli_stderr_never_reaches_the_tool_error():
         c.close()
 
 
-def test_get_totp_reads_the_totp_field_not_another_code():
+def test_raw_totp_tool_is_removed_without_reading_credentials():
     d, c = start()
-    op = Operator(d)
     try:
-        write(d, "totp.json", {"pin": "999999", "totp": "123456", "otpauth": f"otpauth://totp/Bank?secret={SEED}"})
-        assert (got := c.call("get_totp", share_id="share1", item_id="item1", reason="2fa")) == {"code": "123456"}, got
-        assert "999999" not in json.dumps(got)
+        assert error(c, "get_totp", share_id="share1", item_id="item1", reason="2fa") == "unknown tool get_totp"
+        assert calls(d) == []
     finally:
-        op.close()
         c.close()
 
 
@@ -517,23 +521,6 @@ def test_reason_pass_uri_is_rejected_after_normalization():
     finally:
         c.close()
 
-
-def test_get_totp_returns_only_the_digits_after_approval():
-    d, c = start()
-    op = Operator(d)
-    try:
-        assert (got := c.call("get_totp", share_id="share1", item_id="item1", reason="2fa")) == {"code": "123456"}, got
-        assert op.prompts == [{"action": "totp", "title": "Bank", "reason": "2fa"}], op.prompts
-        op.close()
-        before = len(calls(d))
-        assert (got := error(c, "get_totp", share_id="share1", item_id="item1", reason="2fa")) == "approval unavailable", got
-        assert [a for a in calls(d)[before:] if a[:2] == ["item", "totp"]] == [], calls(d)
-        op = Operator(d, {"op": "allow-net"})
-        assert (got := error(c, "get_totp", share_id="share1", item_id="item1", reason="2fa")) == "release denied", got
-        op.close()
-        assert [a for a in calls(d)[before:] if a[:2] == ["item", "totp"]] == [], calls(d)
-    finally:
-        c.close()
 
 
 def test_pass_cli_gets_a_fresh_environment():
@@ -615,7 +602,7 @@ def test_reason_containing_pass_uri_never_reaches_pass_cli():
         cases = (
             ("describe_item", {"share_id": "share1", "item_id": "item1", "reason": reason}),
             ("describe_item", {"share_id": "share1", "item_id": "item1", "reason": "see pass://share1/item1/pin"}),
-            ("get_totp", {"share_id": "share1", "item_id": "item1", "reason": reason}),
+            ("fill_totp", {"share_id": "share1", "item_id": "item1", "reason": reason}),
             ("fill_login", {"share_id": "share1", "item_id": "item1", "reason": reason}),
             ("run_approved", {"argv": ["/bin/true"], "env": {"PW": REF}, "reason": reason}),
         )
@@ -637,7 +624,7 @@ def test_leading_dash_ids_and_vaults_never_reach_pass_cli():
             ("describe_item", {"share_id": "share1", "item_id": "item1\n--field"}, "item_id is invalid"),
             ("search_items", {"vault": "--help"}, "vault is invalid"),
             ("search_items", {"vault": "V\nW"}, "vault is invalid"),
-            ("get_totp", {"share_id": "-s", "item_id": "item1", "reason": "r"}, "share_id is invalid"),
+            ("fill_totp", {"share_id": "-s", "item_id": "item1", "reason": "r"}, "share_id is invalid"),
             ("fill_login", {"share_id": "share1", "item_id": "-i", "reason": "r"}, "item_id is invalid"),
             ("run_approved", {"argv": ["/bin/true"], "env": {"PW": "pass://share1/-item1/pin"}, "reason": "r"},
              "env PW must be a pass://SHARE_ID/ITEM_ID/FIELD reference"),
@@ -738,15 +725,8 @@ def test_approve_helper_shows_the_claim_on_the_tty():
         ])
         assert want in shown, shown
         assert "\x1b" not in shown, shown
-        c.send({"jsonrpc": "2.0", "id": 91, "method": "tools/call", "params": {
-            "name": "get_totp", "arguments": {"share_id": "share1", "item_id": "item1", "reason": "2fa"}}})
-        shown = read_tty(tty, b"denies.")
-        os.write(tty, b"approve-net\n")
-        assert result(c.read()) == "release denied"
-        want = ("proton-pass release request\n  action:  totp\n  item:    'Bank'\n  reason:  '2fa'\n"
-                "Type approve to release. Anything else denies.")
-        assert want in shown, shown
-        assert [a for a in calls(d) if a[:2] == ["item", "totp"]] == [], calls(d)
+        assert error(c, "get_totp", share_id="share1", item_id="item1", reason="2fa") == "unknown tool get_totp"
+        assert [a for a in calls(d) if a[:2] == ["item", "totp"]] == []
     finally:
         helper.terminate()
         helper.wait()
@@ -838,11 +818,14 @@ def test_search_and_describe_return_metadata_only():
     d, c = start()
     try:
         assert c.call("search_items", query="bank", limit=10) == {
-            "count": 1,
+            "count": 1, "next_offset": None,
             "items": [{"title": "Bank", "type": "login", "vault": "V", "share_id": "share1",
                        "item_id": "item1", "modified": 1}],
         }
         got = c.call("describe_item", share_id="share1", item_id="item1", reason="offline test")
+        assert got.pop("unavailable_reference_fields") == []
+        refs = got.pop("references")
+        assert refs["password"] == "pass://share1/item1/password" and refs["api"] == "pass://share1/item1/api"
         assert got == {
             "title": "Bank", "share_id": "share1", "item_id": "item1", "type": "Login",
             "urls": ["https://bank.com"], "username": "ada", "email": "ada@example.com",
