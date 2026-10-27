@@ -5,6 +5,46 @@ Proton browser flow, and fill saved website logins without copying tokens or
 returning passwords or OTPs to the model. Uses the official
 [Proton Pass CLI](https://protonpass.github.io/pass-cli/) through an MCP stdio server.
 
+## Natural Bot workflows
+
+- **“Sign into this website with my work account.”** `find_login` matches the
+  exact saved origin, optionally the exact username/email. It works even when
+  the saved title is unrelated to the website. A unique match returns ready
+  `fill_arguments`; multiple matches return `choose_account`. The Bot asks which
+  account to use rather than choosing the first. `fill_login`/`fill_totp` keep
+  the requested `website` restriction even when that item has other saved sites.
+- **“Save a login for this signup.”** `create_login` generates its password using
+  the official CLI by default. Optional `password_length` (16–128, default 20)
+  and `password_symbols` (default true) adapt to site rules. It returns both
+  IDs needed for filling. Creating an item is not website account registration.
+- **“Use a disposable email for this signup.”** `create_alias` asks for approval
+  and returns the new forwarding address plus item IDs. This needs write access
+  and Proton alias eligibility; it does not read incoming messages.
+- **“Use the API key stored in Proton for this program.”** `search_items` finds
+  the item; `describe_item` returns `pass://` references, including section names
+  for custom fields. The Bot passes references to `run_approved`, without seeing
+  their values. That runner currently returns only an exit code and cannot
+  access workspace files; see the limitations below.
+
+`capabilities` describes these workflows and approval support without accessing
+Proton. `session_info` reports `connected`, `disconnected`, `incomplete`, or
+`unavailable` with recovery guidance. Cloud responses guide the Bot to `connect`;
+legacy shell setup commands are returned only in terminal mode.
+
+Names are not identifiers: searches use share IDs internally and reject an
+ambiguous vault name. A write can omit its vault only when exactly one vault is
+accessible. `search_items` and `find_login` support `limit` (0–100) and `offset`,
+returning `next_offset`. Website discovery reads each accessible login under the
+supplied audit reason, since CLI list results omit URLs. For large collections,
+scope the search to a vault/share ID. It does not use a cached password index.
+
+References use IDs and exact field names. Case-insensitive duplicate names and
+names outside the runner's reference syntax are reported in
+`unavailable_reference_fields`; the Bot must not guess a replacement. A write
+timeout does not prove that nothing was saved: inspect existing items before
+retrying. See the [CLI capability review](docs/pass-cli-integration.md) for the
+full feature map and remaining integration work.
+
 ## Connect
 
 1. Install this repository as a Cursor/Grok Bot plugin. Its `mcp.json` launches
@@ -118,15 +158,18 @@ if that process restarts, use `session_info` to inspect the saved shared state.
 
 | Tool | Result visible to the model |
 | --- | --- |
+| `capabilities` | Supported workflows, limitations and host approval support; no login |
 | `connect` | Connection ID and state; sometimes the Proton authorization URL |
 | `connection_status` | State, authorization link or temporary cloud form link; no credentials |
 | `cancel_connection` | Cancellation status |
 | `disconnect` | Local disconnect result and explicit remote-revocation status |
 | `session_info` | Vault roles, token expiry, approval capability and recovery guidance |
 | `list_vaults`, `search_items`, `describe_item` | Vault/item metadata; no secret values |
+| `find_login` | Exact-origin candidates, account choice or fill arguments; no filling |
 | `fill_login` | Fields filled, submission/detection status; no password or OTP |
 | `fill_totp` | Fills a later OTP screen; result contains status only |
-| `create_login` | Generated password stored in a vault; returns item ID only |
+| `create_login` | Generated password stored in a vault; returns share and item IDs |
+| `create_alias` | New forwarding email address and share/item IDs |
 | `run_approved` | Exit code of a sandboxed command; no output |
 
 There is **no `get_totp` tool**. `fill_login` and `fill_totp` report `totp: filled`

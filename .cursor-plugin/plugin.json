@@ -1,7 +1,7 @@
 {
   "name": "proton-pass",
   "displayName": "Proton Pass",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "repository": "https://github.com/janozeli/proton-pass-plugin",
   "description": "Proton Pass for Grok Bot cloud computers. Connect through Proton web login, share scoped access across Bots, and fill passwords and OTPs without returning their values. Sensitive operations request human approval through MCP elicitation.",
   "author": {

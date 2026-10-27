@@ -46,4 +46,6 @@ class Client:
         return json.loads(text)
 
     def close(self):
-        self.p.stdin.close(); self.p.wait()
+        self.p.stdin.close()
+        self.p.wait()
+        self.p.stdout.close()

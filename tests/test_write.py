@@ -122,12 +122,12 @@ def test_create_login_waits_for_approval_and_does_not_return_the_password():
         op = Operator(d)
         got = c.call("create_login", vault="V", title="Mail", username="ada", password=PASSWORD,
                      urls=["https://mail.example/login"], reason="save")
-        assert got == {"item_id": "item-new"}, got
+        assert got == {"share_id": "share1", "item_id": "item-new"}, got
         assert PASSWORD not in json.dumps(got) and PASSWORD not in json.dumps(op.prompts)
         assert all(PASSWORD not in json.dumps(call) for call in calls(d))
         body = created(d)
         assert body["password"] == PASSWORD and body["title"] == "Mail" and body["username"] == "ada"
-        assert op.prompts[-1]["action"] == "write" and op.prompts[-1]["change"] == "create login"
+        assert op.prompts[-1]["action"] == "write" and "create login in vault share1" in op.prompts[-1]["change"]
         op.close()
     finally:
         c.close()
@@ -141,7 +141,7 @@ def test_generate_password_is_not_returned_or_passed_on_the_command_line():
         got = c.call("create_login", share_id="share1", title="Mail", generate_password=True, reason="save")
         body = created(d)
         secret = body["password"]
-        assert got == {"item_id": "item-new"} and secret and secret not in json.dumps(got)
+        assert got == {"share_id": "share1", "item_id": "item-new"} and secret and secret not in json.dumps(got)
         assert secret not in json.dumps(op.prompts)
         assert all(secret not in json.dumps(call) for call in calls(d))
         assert error(c, "create_login", share_id="share1", title="Mail", password=PASSWORD,

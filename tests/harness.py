@@ -49,6 +49,13 @@ if args[:1] == ["info"]:
     finish(err="session invalidated", code=1)
 if os.path.exists(path("stderr")):
     finish(err=open(path("stderr")).read(), code=1)
+if args[:3] == ["password", "generate", "random"]:
+    length = int(args[args.index("--length") + 1])
+    symbols = args[args.index("--symbols") + 1] == "true"
+    finish(json.dumps({"password": "P7a" + "x" * (length - 4) + ("!" if symbols else "z")}))
+if args[:3] == ["item", "alias", "create"]:
+    open(path("alias-created"), "w").write(json.dumps(args))
+    finish(json.dumps({"id": "alias-new", "alias": "signup.random@passmail.net", "unexpected": "secret-not-for-the-model"}))
 if args[:3] == ["item", "create", "login"]:
     open(path("created.json"), "w").write(sys.stdin.read())
     finish("item-new\n")
@@ -75,6 +82,13 @@ replies = {"vault list": "vaults.json", "item list": "items.json", "item view": 
 name = replies.get(" ".join(args[:2]))
 if not name:
     finish(err="unexpected " + " ".join(args), code=1)
+if args[:2] == ["item", "list"] and os.path.exists(path("items-by-share.json")):
+    share = args[args.index("--share-id") + 1]
+    finish(json.dumps({"items": json.load(open(path("items-by-share.json")))[share]}))
+if args[:2] == ["item", "view"] and os.path.exists(path("items-by-id.json")):
+    share = args[args.index("--share-id") + 1]
+    item = args[args.index("--item-id") + 1]
+    finish(json.dumps({"item": json.load(open(path("items-by-id.json")))[share + "/" + item]}))
 finish(open(path(name)).read())
 '''
 

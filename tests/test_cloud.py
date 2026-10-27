@@ -228,7 +228,7 @@ def test_mcp_approval_binds_write_and_decline_never_changes_vault():
         assert not Path(root, "created.json").exists()
         c.consent = accept
         result = c.call("create_login", share_id="share1", title="Test account", generate_password=True, reason="requested account")
-        assert result == {"item_id": "item-new"}
+        assert result == {"share_id": "share1", "item_id": "item-new"}
         saved = Path(root, "created.json").read_text()
         assert len(saved) > 20 and "password" in saved
         assert not any(cmd[:2] == ["item", "totp"] for cmd in calls(root))

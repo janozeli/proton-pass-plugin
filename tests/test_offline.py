@@ -46,7 +46,7 @@ def test_get_secret_and_run_with_secrets_are_unknown_tools():
         assert (got := error(c, "run_with_secrets", command="env", env={"PW": REF})) == "unknown tool run_with_secrets", got
         names = [t["name"] for t in c.rpc("tools/list")["tools"]]
         assert names == ["list_vaults", "search_items", "describe_item", "session_info", "fill_totp",
-                         "fill_login", "create_login", "save_totp", "run_approved", "connect", "connection_status", "cancel_connection", "disconnect"], names
+                         "fill_login", "create_login", "save_totp", "run_approved", "capabilities", "find_login", "create_alias", "connect", "connection_status", "cancel_connection", "disconnect"], names
         assert calls(d) == [], calls(d)
     finally:
         c.close()
@@ -58,13 +58,16 @@ def test_no_tool_takes_a_forbidden_parameter():
         tools = c.rpc("tools/list")["tools"]
         props = {t["name"]: sorted(t["inputSchema"]["properties"]) for t in tools}
         assert props == {
-            "list_vaults": [], "search_items": ["limit", "query", "type", "vault"],
+            "list_vaults": [], "search_items": ["limit", "offset", "query", "share_id", "type", "vault"],
             "describe_item": ["item_id", "reason", "share_id"], "session_info": [],
-            "fill_totp": ["cdp_port", "item_id", "reason", "share_id"],
+            "capabilities": [],
+            "find_login": ["account", "limit", "offset", "reason", "share_id", "vault", "website"],
+            "create_alias": ["prefix", "reason", "share_id", "vault"],
+            "fill_totp": ["cdp_port", "item_id", "reason", "share_id", "website"],
             "connect": ["expiration", "mode", "role", "vaults"],
             "connection_status": ["connection_id"], "cancel_connection": ["connection_id"], "disconnect": [],
-            "fill_login": ["auto_2fa", "cdp_port", "item_id", "reason", "share_id", "submit"],
-            "create_login": ["email", "generate_password", "otpauth_uri", "password", "reason", "seed",
+            "fill_login": ["auto_2fa", "cdp_port", "item_id", "reason", "share_id", "submit", "website"],
+            "create_login": ["email", "generate_password", "otpauth_uri", "password", "password_length", "password_symbols", "reason", "seed",
                              "share_id", "title", "urls", "username", "vault"],
             "save_totp": ["item_id", "otpauth_uri", "reason", "seed", "share_id"],
             "run_approved": ["argv", "env", "reason"],
@@ -174,7 +177,7 @@ def test_run_child_has_no_network_and_no_host_secrets_under_approve():
         assert runs(d) == [["run", "--", BWRAP, *SANDBOX, *launch(argv, ["PW"])]], runs(d)
         cli_env = json.load(open(os.path.join(d, "run-env.json")))
         assert cli_env == {"PATH": os.environ["PATH"], "PROTON_PASS_SESSION_DIR": session(d),
-                           "PROTON_PASS_AGENT_REASON": "proton-pass plugin", "PP0": REF}, cli_env
+                           "PROTON_PASS_AGENT_REASON": "deploy", "PP0": REF}, cli_env
         assert (fds := json.load(open(os.path.join(d, "run-fds.json")))) == ["/dev/null"] * 3, fds
         try:
             listener.accept()
@@ -470,6 +473,10 @@ def test_describe_item_returns_no_note_card_number_or_private_key():
                 "title": "Bank", "note": note, "content": {kind: content},
                 "extra_fields": [{"name": "backup", "content": {"Hidden": key}}]}}})
             got = c.call("describe_item", share_id="share1", item_id="item1", reason="r")
+            assert not any(secret in json.dumps(got) for secret in (note, card, key)), got
+            refs = got.pop("references")
+            assert refs["number" if kind == "CreditCard" else "private_key"].startswith("pass://share1/item1/")
+            assert got.pop("unavailable_reference_fields") == []
             assert got == {"title": "Bank", "share_id": "share1", "item_id": "item1", "type": kind, "urls": [],
                            "username": "", "email": "", "has_password": False, "has_totp": False,
                            "extra_field_names": ["backup"], "has_note": True}, got
@@ -811,11 +818,14 @@ def test_search_and_describe_return_metadata_only():
     d, c = start()
     try:
         assert c.call("search_items", query="bank", limit=10) == {
-            "count": 1,
+            "count": 1, "next_offset": None,
             "items": [{"title": "Bank", "type": "login", "vault": "V", "share_id": "share1",
                        "item_id": "item1", "modified": 1}],
         }
         got = c.call("describe_item", share_id="share1", item_id="item1", reason="offline test")
+        assert got.pop("unavailable_reference_fields") == []
+        refs = got.pop("references")
+        assert refs["password"] == "pass://share1/item1/password" and refs["api"] == "pass://share1/item1/api"
         assert got == {
             "title": "Bank", "share_id": "share1", "item_id": "item1", "type": "Login",
             "urls": ["https://bank.com"], "username": "ada", "email": "ada@example.com",
